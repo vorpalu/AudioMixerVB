@@ -56,6 +56,9 @@ public partial class MainForm : Form
     private NumericUpDown streamLatencyNumericUpDown = null!;
     private Label streamWarningLabel = null!;
     private DualMixChannelStripControl masterStripControl = null!;
+    private Panel unassignedAppsContainerPanel = null!;
+    private FlowLayoutPanel unassignedAppsFlowPanel = null!;
+    private Label unassignedAppsTitleLabel = null!;
     private Button clearLogButton = null!;
     private Button copyLogButton = null!;
     private CheckBox autoScrollLogCheckBox = null!;
@@ -77,6 +80,7 @@ public partial class MainForm : Form
         BuildStreamMixPanel();
         SetupAppSessionsGrid();
         LoadRoutingOptions();
+        BuildMixerUnassignedAppsPanel();
         BuildChannelPanels();
         BuildLogTools();
         SetMonitorButtons(isRunning: false, operationInProgress: false);
@@ -517,7 +521,7 @@ public partial class MainForm : Form
 
     private static void ApplyDarkTheme(Control control)
     {
-        if (control is ChannelStripControl or DualMixChannelStripControl)
+        if (control is ChannelStripControl or DualMixChannelStripControl or AppChipControl)
         {
             return;
         }
@@ -568,6 +572,68 @@ public partial class MainForm : Form
         {
             ApplyDarkTheme(child);
         }
+    }
+
+    private void BuildMixerUnassignedAppsPanel()
+    {
+        channelsContainer.SuspendLayout();
+        channelsContainer.Controls.Remove(channelsTable);
+        channelsContainer.RowStyles.Clear();
+        channelsContainer.RowCount = 3;
+        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 74F));
+        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        unassignedAppsContainerPanel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(3),
+            Padding = new Padding(8),
+            BackColor = Color.FromArgb(32, 36, 43)
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            ColumnCount = 2,
+            Dock = DockStyle.Fill,
+            RowCount = 1,
+            BackColor = Color.FromArgb(32, 36, 43)
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126F));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        unassignedAppsTitleLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(242, 244, 248),
+            Text = "Unassigned Apps",
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        unassignedAppsFlowPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Color.FromArgb(24, 27, 33),
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            AutoScroll = false,
+            Padding = new Padding(4)
+        };
+
+        layout.Controls.Add(unassignedAppsTitleLabel, 0, 0);
+        layout.Controls.Add(unassignedAppsFlowPanel, 1, 0);
+        unassignedAppsContainerPanel.Controls.Add(layout);
+
+        RegisterUnassignedDropTarget(unassignedAppsContainerPanel);
+        RegisterUnassignedDropTarget(layout);
+        RegisterUnassignedDropTarget(unassignedAppsFlowPanel);
+        RegisterUnassignedDropTarget(unassignedAppsTitleLabel);
+
+        channelsContainer.Controls.Add(unassignedAppsContainerPanel, 0, 1);
+        channelsContainer.Controls.Add(channelsTable, 0, 2);
+        channelsContainer.ResumeLayout();
     }
 
     private void BuildChannelPanels()
@@ -636,8 +702,108 @@ public partial class MainForm : Form
         stripControl.MonitorMuteButton.Click += (_, _) => ToggleChannelMute(controls);
         stripControl.StreamTrackBar.ValueChanged += (_, _) => HandleMixerStreamVolumeChanged(controls);
         stripControl.StreamMuteButton.Click += (_, _) => ToggleMixerStreamMute(controls);
+        RegisterChannelDropTarget(stripControl, channel.Name);
 
         return controls;
+    }
+
+    private void RegisterChannelDropTarget(Control target, string channelName)
+    {
+        target.AllowDrop = true;
+        target.DragEnter += (_, args) => HandleChannelDragOver(args, channelName);
+        target.DragOver += (_, args) => HandleChannelDragOver(args, channelName);
+        target.DragLeave += (_, _) => SetChannelDropHighlight(channelName, highlighted: false);
+        target.DragDrop += (_, args) =>
+        {
+            SetChannelDropHighlight(channelName, highlighted: false);
+            if (TryGetDraggedApp(args, out var draggedApp))
+            {
+                AssignAppFromMixer(draggedApp.ProcessName, channelName);
+            }
+        };
+
+        foreach (Control child in target.Controls)
+        {
+            RegisterChannelDropTarget(child, channelName);
+        }
+    }
+
+    private void RegisterUnassignedDropTarget(Control target)
+    {
+        target.AllowDrop = true;
+        target.DragEnter += (_, args) => HandleUnassignedDragOver(args);
+        target.DragOver += (_, args) => HandleUnassignedDragOver(args);
+        target.DragLeave += (_, _) => SetUnassignedDropHighlight(highlighted: false);
+        target.DragDrop += (_, args) =>
+        {
+            SetUnassignedDropHighlight(highlighted: false);
+            if (TryGetDraggedApp(args, out var draggedApp))
+            {
+                AssignAppFromMixer(draggedApp.ProcessName, channelName: null);
+            }
+        };
+    }
+
+    private void HandleChannelDragOver(DragEventArgs args, string channelName)
+    {
+        if (!TryGetDraggedApp(args, out _))
+        {
+            args.Effect = DragDropEffects.None;
+            SetChannelDropHighlight(channelName, highlighted: false);
+            return;
+        }
+
+        args.Effect = DragDropEffects.Move;
+        SetChannelDropHighlight(channelName, highlighted: true);
+    }
+
+    private void HandleUnassignedDragOver(DragEventArgs args)
+    {
+        if (!TryGetDraggedApp(args, out _))
+        {
+            args.Effect = DragDropEffects.None;
+            SetUnassignedDropHighlight(highlighted: false);
+            return;
+        }
+
+        args.Effect = DragDropEffects.Move;
+        SetUnassignedDropHighlight(highlighted: true);
+    }
+
+    private static bool TryGetDraggedApp(DragEventArgs args, out AppChipDragData draggedApp)
+    {
+        draggedApp = null!;
+        if (args.Data is null || !args.Data.GetDataPresent(typeof(AppChipDragData)))
+        {
+            return false;
+        }
+
+        draggedApp = args.Data.GetData(typeof(AppChipDragData)) as AppChipDragData ?? null!;
+        return draggedApp is not null && !string.IsNullOrWhiteSpace(draggedApp.ProcessName);
+    }
+
+    private void SetChannelDropHighlight(string channelName, bool highlighted)
+    {
+        if (channelControlsByName.TryGetValue(channelName, out var controls))
+        {
+            controls.StripControl.SetDropHighlight(highlighted);
+        }
+    }
+
+    private void SetUnassignedDropHighlight(bool highlighted)
+    {
+        if (unassignedAppsContainerPanel is null || unassignedAppsFlowPanel is null)
+        {
+            return;
+        }
+
+        var color = highlighted
+            ? Color.FromArgb(37, 42, 51)
+            : Color.FromArgb(32, 36, 43);
+        unassignedAppsContainerPanel.BackColor = color;
+        unassignedAppsFlowPanel.BackColor = highlighted
+            ? Color.FromArgb(37, 42, 51)
+            : Color.FromArgb(24, 27, 33);
     }
 
     private static string GetChannelIconText(string channelName)
@@ -2527,10 +2693,7 @@ public partial class MainForm : Form
             };
         }
 
-        settings.RoutingRules = rules
-            .OrderBy(rule => rule.Key, StringComparer.OrdinalIgnoreCase)
-            .Select(rule => rule.Value)
-            .ToList();
+        StoreRoutingRuleMap(rules);
 
         AssignChannelsToSessions();
         appGroups = BuildAppGroups();
@@ -2559,32 +2722,224 @@ public partial class MainForm : Form
 
         foreach (var controls in channelControlsByName.Values)
         {
-            controls.StripControl.AppSummary = FormatAssignedAppsSummary(controls.Channel.Name);
+            var assignedGroups = appGroups
+                .Where(group => group.AssignedChannel.Equals(controls.Channel.Name, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var visibleGroups = assignedGroups.Take(2).ToList();
+            var chips = visibleGroups
+                .Select(group => CreateAppChip(group, controls.Channel.Name))
+                .Cast<Control>()
+                .ToList();
+            controls.StripControl.SetAppChips(chips, assignedGroups.Count - visibleGroups.Count);
+        }
+
+        UpdateUnassignedAppChips();
+    }
+
+    private void UpdateUnassignedAppChips()
+    {
+        if (unassignedAppsFlowPanel is null)
+        {
+            return;
+        }
+
+        unassignedAppsFlowPanel.SuspendLayout();
+        var oldControls = unassignedAppsFlowPanel.Controls.Cast<Control>().ToList();
+        unassignedAppsFlowPanel.Controls.Clear();
+        foreach (var control in oldControls)
+        {
+            control.Dispose();
+        }
+
+        var unassignedGroups = appGroups
+            .Where(group => group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+            .Where(group => !ShouldHideFromUnassignedMixer(group))
+            .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (unassignedGroups.Count == 0)
+        {
+            var placeholder = CreateMixerPlaceholderLabel("No apps");
+            RegisterUnassignedDropTarget(placeholder);
+            unassignedAppsFlowPanel.Controls.Add(placeholder);
+        }
+        else
+        {
+            foreach (var group in unassignedGroups)
+            {
+                unassignedAppsFlowPanel.Controls.Add(CreateAppChip(group, channelDropTarget: null));
+            }
+        }
+
+        unassignedAppsFlowPanel.ResumeLayout();
+    }
+
+    private AppChipControl CreateAppChip(AudioAppGroup group, string? channelDropTarget)
+    {
+        var chip = new AppChipControl(group.ProcessName, GetAppChipStatus(group));
+        if (channelDropTarget is null)
+        {
+            RegisterUnassignedDropTarget(chip);
+            RegisterUnassignedDropTargetForChildren(chip);
+        }
+        else
+        {
+            RegisterChannelDropTarget(chip, channelDropTarget);
+        }
+
+        return chip;
+    }
+
+    private void RegisterUnassignedDropTargetForChildren(Control control)
+    {
+        foreach (Control child in control.Controls)
+        {
+            RegisterUnassignedDropTarget(child);
+            RegisterUnassignedDropTargetForChildren(child);
         }
     }
 
-    private string FormatAssignedAppsSummary(string channelName)
+    private static Label CreateMixerPlaceholderLabel(string text)
     {
-        var assignedApps = appGroups
-            .Where(group => group.AssignedChannel.Equals(channelName, StringComparison.OrdinalIgnoreCase))
-            .Select(group => group.ProcessName)
-            .Where(processName => !string.IsNullOrWhiteSpace(processName))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(processName => processName, StringComparer.OrdinalIgnoreCase)
+        return new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(6, 7, 4, 4),
+            Font = new Font("Segoe UI", 8.5F),
+            ForeColor = Color.FromArgb(170, 176, 188),
+            Text = text
+        };
+    }
+
+    private static bool ShouldHideFromUnassignedMixer(AudioAppGroup group)
+    {
+        return group.ProcessName.Equals("System Sounds", StringComparison.OrdinalIgnoreCase) ||
+            group.DisplayName.Equals("System Sounds", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static AppChipStatus GetAppChipStatus(AudioAppGroup group)
+    {
+        if (group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            return AppChipStatus.Neutral;
+        }
+
+        if (group.Status.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(group.TargetEndpointId))
+        {
+            return AppChipStatus.Error;
+        }
+
+        return group.AreAllSessionsOnTarget() ||
+            group.Status.Contains("Routed", StringComparison.OrdinalIgnoreCase) ||
+            group.Status.Contains("Already", StringComparison.OrdinalIgnoreCase)
+                ? AppChipStatus.Routed
+                : AppChipStatus.Pending;
+    }
+
+    private void AssignAppFromMixer(string processName, string? channelName)
+    {
+        var normalizedProcessName = NormalizeProcessName(processName);
+        if (string.IsNullOrWhiteSpace(normalizedProcessName))
+        {
+            return;
+        }
+
+        var rules = GetRoutingRuleMap();
+        if (string.IsNullOrWhiteSpace(channelName) ||
+            channelName.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            rules.Remove(normalizedProcessName);
+            AppendLog($"Unassigned {normalizedProcessName}");
+        }
+        else
+        {
+            var channel = MixerChannel.DefaultChannelNames.FirstOrDefault(name =>
+                name.Equals(channelName, StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(channel))
+            {
+                AppendLog($"Cannot assign {normalizedProcessName}: unknown channel {channelName}.");
+                return;
+            }
+
+            var target = ResolveTargetEndpoint(channel, null);
+            rules[normalizedProcessName] = new AppRoutingRule
+            {
+                ProcessName = normalizedProcessName,
+                PreferredChannel = channel,
+                PreferredEndpointId = target?.Id,
+                PreferredEndpointFriendlyName = target?.FriendlyName,
+                Enabled = true
+            };
+            AppendLog($"Assigned {normalizedProcessName} to {channel}");
+        }
+
+        StoreRoutingRuleMap(rules);
+        AssignChannelsToSessions();
+        appGroups = BuildAppGroups();
+        BindAppSessionsGrid();
+        UpdateChannelControlAvailability();
+        SaveSettings();
+
+        if (!string.IsNullOrWhiteSpace(channelName) &&
+            !channelName.Equals("None", StringComparison.OrdinalIgnoreCase) &&
+            settings.AutoApplyRoutingRules)
+        {
+            ApplyRoutingForProcessFromMixer(normalizedProcessName);
+        }
+    }
+
+    private void ApplyRoutingForProcessFromMixer(string normalizedProcessName)
+    {
+        var successfulRoutes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var processed = false;
+
+        foreach (DataGridViewRow row in appSessionsGrid.Rows)
+        {
+            var rowProcessName = row.Tag switch
+            {
+                AudioAppGroup group => group.ProcessName,
+                AudioAppSession session => session.ProcessName,
+                _ => string.Empty
+            };
+
+            if (!NormalizeProcessName(rowProcessName).Equals(normalizedProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            processed |= row.Tag switch
+            {
+                AudioAppGroup group => ApplyRoutingToGroup(row, group, successfulRoutes, autoTriggered: false),
+                AudioAppSession session => ApplyRoutingToSession(row, session, successfulRoutes, autoTriggered: false),
+                _ => false
+            };
+        }
+
+        if (!processed)
+        {
+            AppendLog($"{normalizedProcessName} auto apply skipped: active app group not found.");
+            return;
+        }
+
+        SaveSettings();
+        RefreshAppSessions(logDetails: false);
+        ApplyPostRoutingStatuses(successfulRoutes);
+        LogPostApplyRoutingState(autoTriggered: false, successfulRoutes);
+        UpdateMixerAppSummaries();
+    }
+
+    private void StoreRoutingRuleMap(IDictionary<string, AppRoutingRule> rules)
+    {
+        settings.RoutingRules = rules
+            .OrderBy(rule => rule.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(rule =>
+            {
+                rule.Value.ProcessName = rule.Key;
+                return rule.Value;
+            })
             .ToList();
-
-        if (assignedApps.Count == 0)
-        {
-            return "No apps";
-        }
-
-        var visibleApps = assignedApps.Take(2).ToList();
-        if (assignedApps.Count > visibleApps.Count)
-        {
-            visibleApps.Add($"+{assignedApps.Count - visibleApps.Count} more");
-        }
-
-        return string.Join(Environment.NewLine, visibleApps);
     }
 
     private Dictionary<string, AppRoutingRule> GetRoutingRuleMap()

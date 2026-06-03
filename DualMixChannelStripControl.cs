@@ -16,7 +16,9 @@ public sealed class DualMixChannelStripControl : UserControl
     private readonly Label nameLabel = new();
     private readonly ComboBox endpointComboBox = new();
     private readonly TableLayoutPanel mixesLayout = new();
+    private readonly Panel appAreaPanel = new();
     private readonly Label appSummaryLabel = new();
+    private readonly FlowLayoutPanel appChipsPanel = new();
     private readonly VuMeterControl monitorVuMeter = new();
     private readonly VuMeterControl streamVuMeter = new();
     private readonly TrackBar monitorTrackBar = new();
@@ -27,6 +29,7 @@ public sealed class DualMixChannelStripControl : UserControl
     private readonly Button streamMuteButton = new();
 
     private Color accentColor = Color.DeepSkyBlue;
+    private bool isDropHighlighted;
 
     public DualMixChannelStripControl()
     {
@@ -90,6 +93,10 @@ public sealed class DualMixChannelStripControl : UserControl
         mixesLayout.Controls.Add(CreateMixColumn("MON", monitorVuMeter, monitorTrackBar, monitorPercentLabel, monitorMuteButton), 0, 0);
         mixesLayout.Controls.Add(CreateMixColumn("STR", streamVuMeter, streamTrackBar, streamPercentLabel, streamMuteButton), 1, 0);
 
+        appAreaPanel.Dock = DockStyle.Fill;
+        appAreaPanel.BackColor = InnerColor;
+        appAreaPanel.Padding = new Padding(4);
+
         appSummaryLabel.Dock = DockStyle.Fill;
         appSummaryLabel.BackColor = InnerColor;
         appSummaryLabel.ForeColor = SecondaryTextColor;
@@ -99,11 +106,21 @@ public sealed class DualMixChannelStripControl : UserControl
         appSummaryLabel.Padding = new Padding(5);
         appSummaryLabel.AutoEllipsis = true;
 
+        appChipsPanel.Dock = DockStyle.Fill;
+        appChipsPanel.BackColor = InnerColor;
+        appChipsPanel.FlowDirection = FlowDirection.TopDown;
+        appChipsPanel.WrapContents = false;
+        appChipsPanel.AutoScroll = false;
+        appChipsPanel.Visible = false;
+
+        appAreaPanel.Controls.Add(appChipsPanel);
+        appAreaPanel.Controls.Add(appSummaryLabel);
+
         layout.Controls.Add(iconLabel, 0, 0);
         layout.Controls.Add(nameLabel, 0, 1);
         layout.Controls.Add(endpointComboBox, 0, 2);
         layout.Controls.Add(mixesLayout, 0, 3);
-        layout.Controls.Add(appSummaryLabel, 0, 4);
+        layout.Controls.Add(appAreaPanel, 0, 4);
 
         Controls.Add(layout);
         Controls.Add(accentPanel);
@@ -127,6 +144,8 @@ public sealed class DualMixChannelStripControl : UserControl
     public VuMeterControl StreamVuMeter => streamVuMeter;
 
     public ComboBox EndpointComboBox => endpointComboBox;
+
+    public FlowLayoutPanel AppChipsPanel => appChipsPanel;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string ChannelName
@@ -206,7 +225,7 @@ public sealed class DualMixChannelStripControl : UserControl
     public string AppSummary
     {
         get => appSummaryLabel.Text;
-        set => appSummaryLabel.Text = string.IsNullOrWhiteSpace(value) ? "No apps" : value;
+        set => ShowSummary(value);
     }
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -229,6 +248,59 @@ public sealed class DualMixChannelStripControl : UserControl
         endpointComboBox.Enabled = enabled;
     }
 
+    public void SetAppChips(IEnumerable<Control> chipControls, int hiddenCount)
+    {
+        appChipsPanel.SuspendLayout();
+        var existingControls = appChipsPanel.Controls.Cast<Control>().ToList();
+        appChipsPanel.Controls.Clear();
+        foreach (var control in existingControls)
+        {
+            control.Dispose();
+        }
+
+        var visibleCount = 0;
+        foreach (var chipControl in chipControls)
+        {
+            appChipsPanel.Controls.Add(chipControl);
+            visibleCount++;
+        }
+
+        if (hiddenCount > 0)
+        {
+            appChipsPanel.Controls.Add(CreateMoreAppsLabel(hiddenCount));
+        }
+
+        if (visibleCount == 0 && hiddenCount == 0)
+        {
+            appChipsPanel.Controls.Add(CreateNoAppsLabel());
+        }
+
+        appSummaryLabel.Visible = false;
+        appChipsPanel.Visible = true;
+        appChipsPanel.ResumeLayout();
+    }
+
+    public void ShowSummary(string? text)
+    {
+        appSummaryLabel.Text = string.IsNullOrWhiteSpace(text) ? "No apps" : text;
+        appSummaryLabel.Visible = true;
+        appChipsPanel.Visible = false;
+    }
+
+    public void SetDropHighlight(bool highlighted)
+    {
+        if (isDropHighlighted == highlighted)
+        {
+            return;
+        }
+
+        isDropHighlighted = highlighted;
+        appAreaPanel.BackColor = highlighted ? Color.FromArgb(37, 42, 51) : InnerColor;
+        appChipsPanel.BackColor = appAreaPanel.BackColor;
+        appSummaryLabel.BackColor = appAreaPanel.BackColor;
+        Invalidate();
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
@@ -238,8 +310,37 @@ public sealed class DualMixChannelStripControl : UserControl
             return;
         }
 
-        using var borderPen = new Pen(BorderColor);
+        using var borderPen = new Pen(isDropHighlighted ? accentColor : BorderColor, isDropHighlighted ? 3F : 1F);
         e.Graphics.DrawRectangle(borderPen, 0, 0, bounds.Width - 1, bounds.Height - 1);
+    }
+
+    private static Label CreateNoAppsLabel()
+    {
+        return new Label
+        {
+            AutoSize = false,
+            Dock = DockStyle.Top,
+            Height = 24,
+            ForeColor = SecondaryTextColor,
+            Font = new Font("Segoe UI", 8.5F),
+            Text = "No apps",
+            TextAlign = ContentAlignment.MiddleCenter
+        };
+    }
+
+    private static Label CreateMoreAppsLabel(int hiddenCount)
+    {
+        return new Label
+        {
+            AutoSize = false,
+            Height = 22,
+            Width = 120,
+            Margin = new Padding(2),
+            ForeColor = SecondaryTextColor,
+            Font = new Font("Segoe UI", 8F, FontStyle.Bold),
+            Text = $"+{hiddenCount} more",
+            TextAlign = ContentAlignment.MiddleLeft
+        };
     }
 
     private static TableLayoutPanel CreateMixColumn(
