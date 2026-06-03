@@ -1,6 +1,6 @@
 # AudioMixerVB
 
-AudioMixerVB is a Windows-only C# WinForms mixer for controlling four virtual audio endpoint volumes:
+AudioMixerVB is a Windows-only C# WinForms mixer for routing apps into four VB-CABLE channels and mixing them into separate Monitor and Stream mixes:
 
 - Game
 - Chat
@@ -66,7 +66,7 @@ The file is written next to the executable and stores:
 - channel volume mode
 - experimental/auto routing options
 - monitor mix output/input endpoints
-- monitor mix gains, mutes, latency, and slider mode
+- monitor mix master gain, channel gains, mutes, latency, and slider mode
 - stream mix output endpoint
 - stream mix master gain, channel gains, mutes, and latency
 - selected COM port
@@ -179,7 +179,7 @@ Automatic routing writes the Windows per-app output preference. Some application
 
 `Auto apply` refreshes and applies routing rules every three seconds without repeating identical log messages.
 
-Endpoint volume control is still present as a fallback when no active routed application session matches a channel.
+The Mixer tab controls Monitor Mix gain. It does not change Windows app-session volume or VB-CABLE endpoint volume, because those source-level changes would affect both Monitor and Stream mixes.
 
 ### Automatic Routing Test
 
@@ -218,11 +218,11 @@ For the shared monitor mix, Windows `Listen to this device` is not required. It 
 
 Channel slider mode:
 
-- `App Session Volume`: channel sliders control matching app sessions through `ISimpleAudioVolume`.
-- `Monitor Mix Gain`: channel sliders control only the monitor mix gain.
-- `Both`: channel sliders control app session volume and monitor mix gain.
+- `Monitor Mix Gain`: channel sliders control only the Monitor Mix heard in headphones.
 
-`Both` is the default. Monitor gain is a 0.0-1.0 scalar and is not boosted above unity.
+`Monitor Mix Gain` is the default. Monitor gain is a 0.0-1.0 scalar and is not boosted above unity.
+
+AudioMixerVB keeps Monitor Mix gains separate from Stream Mix gains. App Session Volume changes Windows app volume before audio reaches both Monitor and Stream mixes, so it is not used by the Mixer tab when independent monitor/stream mixes are needed.
 
 ### Monitor Mix Test
 
@@ -271,6 +271,8 @@ Stream Mix:
 - Captures the same `CABLE-A/B/C/D Output` channel sources
 - Applies independent stream gains and mutes
 - Outputs to `CABLE Input (VB-Audio Virtual Cable)`
+
+Changing a Monitor Mix channel gain does not change the Stream Mix gain for that channel. Changing a Stream Mix channel gain does not change the Monitor Mix gain.
 
 OBS:
 

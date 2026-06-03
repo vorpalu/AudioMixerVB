@@ -15,11 +15,15 @@ public sealed class MonitorMixEngine : IDisposable
     private readonly Dictionary<string, MeterState> channelMeters = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MonitorChannelSampleProvider> activeProviders = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<CaptureChannel> captureChannels = [];
+    private readonly MeterState masterMeter = new();
 
     private WasapiOut? output;
+    private MasterSampleProvider? masterProvider;
     private string? outputEndpointId;
     private bool disposed;
     private bool isStopping;
+    private float masterGain = 1f;
+    private bool masterMuted;
 
     public MonitorMixEngine()
     {
@@ -70,7 +74,7 @@ public sealed class MonitorMixEngine : IDisposable
     {
         lock (syncRoot)
         {
-            return Math.Clamp(channelMeters.Values.Sum(meter => meter.GetPeak()), 0f, 1f);
+            return masterMeter.GetPeak();
         }
     }
 
@@ -109,8 +113,11 @@ public sealed class MonitorMixEngine : IDisposable
     }
 
     public void SetChannelVolume(string channelName, float volume0to1)
+        => SetChannelGain(channelName, volume0to1);
+
+    public void SetChannelGain(string channelName, float gain0to1)
     {
-        var gain = Math.Clamp(volume0to1, 0f, 1f);
+        var gain = Math.Clamp(gain0to1, 0f, 1f);
         lock (syncRoot)
         {
             channelGains[channelName] = gain;
@@ -118,6 +125,25 @@ public sealed class MonitorMixEngine : IDisposable
             {
                 provider.SetGain(gain);
             }
+        }
+    }
+
+    public void SetMasterGain(float gain0to1)
+    {
+        var gain = Math.Clamp(gain0to1, 0f, 1f);
+        lock (syncRoot)
+        {
+            masterGain = gain;
+            masterProvider?.SetMaster(masterGain, masterMuted);
+        }
+    }
+
+    public void SetMasterMute(bool muted)
+    {
+        lock (syncRoot)
+        {
+            masterMuted = muted;
+            masterProvider?.SetMaster(masterGain, masterMuted);
         }
     }
 
@@ -294,8 +320,9 @@ public sealed class MonitorMixEngine : IDisposable
             throw new InvalidOperationException("Select at least one monitor input before starting.");
         }
 
+        masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, UpdateMasterMeter);
         output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, false, LatencyMs);
-        output.Init(mixer.ToWaveProvider());
+        output.Init(masterProvider.ToWaveProvider());
 
         foreach (var channel in captureChannels)
         {
@@ -332,6 +359,7 @@ public sealed class MonitorMixEngine : IDisposable
             captureChannels.Clear();
             activeProviders.Clear();
             output = null;
+            masterProvider = null;
             IsRunning = false;
         }
 
@@ -436,12 +464,22 @@ public sealed class MonitorMixEngine : IDisposable
         }
     }
 
+    private void UpdateMasterMeter(float peak, float rms)
+    {
+        lock (syncRoot)
+        {
+            masterMeter.Update(peak, rms);
+        }
+    }
+
     private void ResetMeters()
     {
         foreach (var meter in channelMeters.Values)
         {
             meter.Reset();
         }
+
+        masterMeter.Reset();
     }
 
     private sealed class CaptureChannel(
@@ -636,6 +674,81 @@ public sealed class MonitorMixEngine : IDisposable
 
             lastUnderrunLogTicks = now;
             log($"Buffer underrun on {channelName}; using silence.");
+        }
+    }
+
+    private sealed class MasterSampleProvider : ISampleProvider
+    {
+        private readonly ISampleProvider source;
+        private readonly Action<float, float> updateMeter;
+        private readonly object masterLock = new();
+        private float gain;
+        private bool muted;
+
+        public MasterSampleProvider(
+            ISampleProvider source,
+            float gain,
+            bool muted,
+            Action<float, float> updateMeter)
+        {
+            this.source = source;
+            this.gain = Math.Clamp(gain, 0f, 1f);
+            this.muted = muted;
+            this.updateMeter = updateMeter;
+            WaveFormat = source.WaveFormat;
+        }
+
+        public WaveFormat WaveFormat { get; }
+
+        public void SetMaster(float value, bool isMuted)
+        {
+            lock (masterLock)
+            {
+                gain = Math.Clamp(value, 0f, 1f);
+                muted = isMuted;
+            }
+        }
+
+        public int Read(float[] buffer, int offset, int count)
+        {
+            var read = source.Read(buffer, offset, count);
+
+            float currentGain;
+            bool currentlyMuted;
+            lock (masterLock)
+            {
+                currentGain = gain;
+                currentlyMuted = muted;
+            }
+
+            var scalar = currentlyMuted ? 0f : currentGain;
+            var peak = 0f;
+            double squareSum = 0.0;
+            for (var index = 0; index < read; index++)
+            {
+                var sample = buffer[offset + index] * scalar;
+                buffer[offset + index] = sample;
+
+                var absoluteSample = Math.Abs(sample);
+                if (absoluteSample > peak)
+                {
+                    peak = absoluteSample;
+                }
+
+                squareSum += sample * sample;
+            }
+
+            updateMeter(
+                Math.Clamp(peak, 0f, 1f),
+                read == 0 ? 0f : Math.Clamp((float)Math.Sqrt(squareSum / read), 0f, 1f));
+
+            if (read < count)
+            {
+                Array.Clear(buffer, offset + read, count - read);
+                return count;
+            }
+
+            return read;
         }
     }
 

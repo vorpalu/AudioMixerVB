@@ -64,11 +64,9 @@ public sealed class AppSettings
         MonitorMix.ChannelMutes = new Dictionary<string, bool>(
             MonitorMix.ChannelMutes ?? [],
             StringComparer.OrdinalIgnoreCase);
+        MonitorMix.MasterGain = Math.Clamp(MonitorMix.MasterGain, 0f, 1f);
         MonitorMix.LatencyMs = Math.Clamp(MonitorMix.LatencyMs, 20, 500);
-        if (string.IsNullOrWhiteSpace(MonitorMix.ChannelSliderMode))
-        {
-            MonitorMix.ChannelSliderMode = "Monitor Mix Gain";
-        }
+        MonitorMix.ChannelSliderMode = "Monitor Mix Gain";
 
         foreach (var channelName in MixerChannel.DefaultChannelNames)
         {

@@ -177,6 +177,8 @@ public partial class MainForm : Form
         monitorMusicInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Music", monitorMusicInputComboBox);
         monitorMediaInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Media", monitorMediaInputComboBox);
         channelSliderModeComboBox.SelectedIndexChanged += (_, _) => HandleChannelSliderModeChanged();
+        masterStripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleMonitorMasterGainChanged();
+        masterStripControl.MuteButton.Click += (_, _) => ToggleMonitorMasterMute();
         startMonitorButton.Click += (_, _) => StartMonitor();
         stopMonitorButton.Click += async (_, _) => await StopMonitorAsync();
         restartMonitorButton.Click += async (_, _) => await RestartMonitorAsync();
@@ -286,7 +288,7 @@ public partial class MainForm : Form
         monitorMusicInputComboBox = CreateMonitorComboBox();
         monitorMediaInputComboBox = CreateMonitorComboBox();
         channelSliderModeComboBox = CreateMonitorComboBox();
-        channelSliderModeComboBox.Items.AddRange(["Both", "App Session Volume", "Monitor Mix Gain"]);
+        channelSliderModeComboBox.Items.AddRange(["Monitor Mix Gain"]);
 
         startMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Start Monitor", UseVisualStyleBackColor = true };
         stopMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Stop", UseVisualStyleBackColor = true };
@@ -642,13 +644,13 @@ public partial class MainForm : Form
 
         masterStripControl = new ChannelStripControl
         {
-            ChannelName = "Master",
+            ChannelName = "Monitor Master",
             AccentColor = Color.FromArgb(86, 169, 255),
             EndpointComboBoxVisible = false,
-            VolumePercent = 100,
-            IsMuted = false
+            VolumePercent = GainToPercent(settings.MonitorMix.MasterGain),
+            IsMuted = settings.MonitorMix.MasterMuted
         };
-        masterStripControl.SetEndpointControlsEnabled(enabled: false);
+        masterStripControl.SetEndpointControlsEnabled(enabled: true);
         masterStripControl.SetStatus("No output", Color.FromArgb(190, 196, 205));
         channelsTable.Controls.Add(masterStripControl, 0, 0);
 
@@ -671,8 +673,8 @@ public partial class MainForm : Form
         var stripControl = new ChannelStripControl
         {
             ChannelName = channel.Name,
-            VolumePercent = Math.Clamp(channel.VolumePercent, 0, 100),
-            IsMuted = channel.IsMuted
+            VolumePercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(channel.Name, 0.5f)),
+            IsMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(channel.Name)
         };
 
         var controls = new ChannelControls(channel, stripControl);
@@ -921,11 +923,28 @@ public partial class MainForm : Form
 
         channelSliderModeComboBox.SelectedItem = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
         monitorLatencyValueLabel.Text = $"{settings.MonitorMix.LatencyMs} ms";
+        SyncMonitorMixControlsFromSettings();
         updatingMonitorUi = false;
 
         ApplyMonitorSettingsToEngine();
         UpdateMonitorWarning();
         UpdateMasterStripSummary();
+    }
+
+    private void SyncMonitorMixControlsFromSettings()
+    {
+        masterStripControl.VolumePercent = GainToPercent(settings.MonitorMix.MasterGain);
+        masterStripControl.IsMuted = settings.MonitorMix.MasterMuted;
+
+        foreach (var controls in channelControlsByName.Values)
+        {
+            var volumePercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(controls.Channel.Name, 0.5f));
+            var isMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
+            controls.Channel.VolumePercent = volumePercent;
+            controls.Channel.IsMuted = isMuted;
+            SetVolumeUiValue(controls, volumePercent);
+            SetMuteUiValue(controls, isMuted);
+        }
     }
 
     private void PopulateMonitorOutputComboBox()
@@ -1133,6 +1152,30 @@ public partial class MainForm : Form
         }
     }
 
+    private void HandleMonitorMasterGainChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        var volumePercent = masterStripControl.VolumeTrackBar.Value;
+        settings.MonitorMix.MasterGain = volumePercent / 100f;
+        SetMonitorMasterVolumeUiValue(volumePercent);
+        monitorMixEngine.SetMasterGain(settings.MonitorMix.MasterGain);
+        SaveSettings();
+        AppendLog($"Monitor master gain = {volumePercent}%");
+    }
+
+    private void ToggleMonitorMasterMute()
+    {
+        settings.MonitorMix.MasterMuted = !settings.MonitorMix.MasterMuted;
+        monitorMixEngine.SetMasterMute(settings.MonitorMix.MasterMuted);
+        SetMonitorMasterMuteUiValue(settings.MonitorMix.MasterMuted);
+        SaveSettings();
+        AppendLog($"Monitor master mute = {(settings.MonitorMix.MasterMuted ? "on" : "off")}");
+    }
+
     private void HandleChannelSliderModeChanged()
     {
         if (updatingMonitorUi)
@@ -1140,9 +1183,21 @@ public partial class MainForm : Form
             return;
         }
 
-        settings.MonitorMix.ChannelSliderMode = channelSliderModeComboBox.SelectedItem?.ToString() ?? "Monitor Mix Gain";
+        settings.MonitorMix.ChannelSliderMode = NormalizeSliderMode(channelSliderModeComboBox.SelectedItem?.ToString());
         SaveSettings();
         AppendLog($"Channel slider mode = {settings.MonitorMix.ChannelSliderMode}");
+    }
+
+    private void SetMonitorMasterVolumeUiValue(int volumePercent)
+    {
+        updatingMonitorUi = true;
+        masterStripControl.VolumePercent = volumePercent;
+        updatingMonitorUi = false;
+    }
+
+    private void SetMonitorMasterMuteUiValue(bool isMuted)
+    {
+        masterStripControl.IsMuted = isMuted;
     }
 
     private void ApplyMonitorSettingsToEngine()
@@ -1156,13 +1211,16 @@ public partial class MainForm : Form
             var endpointId = settings.MonitorMix.GetCaptureEndpointId(channelName);
             monitorMixEngine.SetChannelInput(channelName, endpointId ?? string.Empty);
 
-            monitorMixEngine.SetChannelVolume(
+            monitorMixEngine.SetChannelGain(
                 channelName,
                 settings.MonitorMix.ChannelGains.GetValueOrDefault(channelName, 0.5f));
             monitorMixEngine.SetChannelMute(
                 channelName,
                 settings.MonitorMix.ChannelMutes.GetValueOrDefault(channelName));
         }
+
+        monitorMixEngine.SetMasterGain(settings.MonitorMix.MasterGain);
+        monitorMixEngine.SetMasterMute(settings.MonitorMix.MasterMuted);
     }
 
     private void StartMonitor()
@@ -1293,7 +1351,7 @@ public partial class MainForm : Form
             : Color.FromArgb(190, 196, 205);
         monitorWarningLabel.Text = output is not null && IsVbCableEndpoint(output)
             ? "Do not monitor into a VB-CABLE endpoint. This may create feedback loop."
-            : "Use a physical output device. Disable Windows 'Listen to this device' on VB-CABLE outputs to avoid doubled audio.";
+            : "Mixer tab controls Monitor Mix only. App Session Volume changes Windows app volume before both Monitor and Stream mixes; use Monitor/Stream gains for independent mixes.";
     }
 
     private void HandleStreamOutputChanged()
@@ -1643,12 +1701,7 @@ public partial class MainForm : Form
 
     private static string NormalizeSliderMode(string? mode)
     {
-        return mode switch
-        {
-            "App Session Volume" => "App Session Volume",
-            "Monitor Mix Gain" => "Monitor Mix Gain",
-            _ => "Both"
-        };
+        return "Monitor Mix Gain";
     }
 
     private AudioEndpoint? FindSelectedEndpoint(MixerChannel channel)
@@ -1713,22 +1766,23 @@ public partial class MainForm : Form
 
         try
         {
-            var isMuted = audioEndpointController.GetMute(endpointId);
-
-            controls.Channel.IsMuted = isMuted;
-            if (!IsApplicationSessionMode())
+            if (!endpoints.Any(endpoint => endpoint.Id.Equals(endpointId, StringComparison.OrdinalIgnoreCase)))
             {
-                controls.Channel.VolumePercent = audioEndpointController.GetVolumePercent(endpointId);
+                throw new InvalidOperationException("Selected endpoint is not active.");
             }
 
-            SetVolumeUiValue(controls, controls.Channel.VolumePercent);
+            var volumePercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(controls.Channel.Name, 0.5f));
+            var isMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
+            controls.Channel.VolumePercent = volumePercent;
+            controls.Channel.IsMuted = isMuted;
+            SetVolumeUiValue(controls, volumePercent);
             SetMuteUiValue(controls, isMuted);
             SetEndpointControlsEnabled(controls, enabled: true);
             SetStatus(controls, isMuted ? "Muted" : "Found");
         }
         catch (Exception ex)
         {
-            SetEndpointControlsEnabled(controls, enabled: false);
+            SetEndpointControlsEnabled(controls, enabled: true);
             SetStatus(controls, "Error");
 
             if (logErrors)
@@ -1754,45 +1808,11 @@ public partial class MainForm : Form
         controls.Channel.VolumePercent = volumePercent;
         SetVolumeUiValue(controls, volumePercent);
 
-        if (ShouldApplyMonitorMixGain())
-        {
-            var gain = volumePercent / 100f;
-            settings.MonitorMix.ChannelGains[controls.Channel.Name] = gain;
-            monitorMixEngine.SetChannelVolume(controls.Channel.Name, gain);
-            AppendLog($"{controls.Channel.Name} monitor gain = {volumePercent}%");
-        }
-
-        if (ShouldApplyAppSessionVolume())
-        {
-            var processNames = GetProcessNamesForChannel(controls.Channel.Name).ToList();
-            if (processNames.Count > 0)
-            {
-                var results = audioSessionController.SetSessionVolumeForProcesses(
-                    endpoints,
-                    processNames,
-                    controls.Channel.Name,
-                    volumePercent);
-
-                LogSessionVolumeResults(controls.Channel.Name, processNames, volumePercent, results);
-
-                if (results.Any(result => result.Status == "Applied"))
-                {
-                    SetEndpointControlsEnabled(controls, enabled: true);
-                    SetStatus(controls, "Found");
-                    SaveSettings();
-                    RefreshAppSessions();
-                    return;
-                }
-            }
-        }
-
-        if (!ShouldApplyAppSessionVolume())
-        {
-            SaveSettings();
-            return;
-        }
-
-        ApplyEndpointVolumeFallback(controls, volumePercent);
+        var gain = volumePercent / 100f;
+        settings.MonitorMix.ChannelGains[controls.Channel.Name] = gain;
+        monitorMixEngine.SetChannelGain(controls.Channel.Name, gain);
+        AppendLog($"{controls.Channel.Name} monitor gain = {volumePercent}%");
+        SaveSettings();
     }
 
     private void ApplyEndpointVolumeFallback(ChannelControls controls, int volumePercent)
@@ -1823,98 +1843,19 @@ public partial class MainForm : Form
 
     private void ToggleChannelMute(ChannelControls controls)
     {
-        if (ShouldApplyAppSessionVolume() && GetProcessNamesForChannel(controls.Channel.Name).Any())
-        {
-            ApplyChannelMute(controls, !controls.Channel.IsMuted);
-            return;
-        }
-
-        var endpointId = controls.Channel.SelectedEndpointId;
-        if (string.IsNullOrWhiteSpace(endpointId))
-        {
-            AppendLog($"{controls.Channel.Name} mute ignored: no endpoint selected.");
-            return;
-        }
-
-        try
-        {
-            var currentMute = audioEndpointController.GetMute(endpointId);
-            ApplyChannelMute(controls, !currentMute);
-        }
-        catch (Exception ex)
-        {
-            SetStatus(controls, "Error");
-            AppendLog($"{controls.Channel.Name} mute read error: {ex.Message}");
-        }
+        var isMuted = !settings.MonitorMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
+        ApplyChannelMute(controls, isMuted);
     }
 
     private void ApplyChannelMute(ChannelControls controls, bool isMuted)
     {
-        if (ShouldApplyMonitorMixGain())
-        {
-            settings.MonitorMix.ChannelMutes[controls.Channel.Name] = isMuted;
-            monitorMixEngine.SetChannelMute(controls.Channel.Name, isMuted);
-            AppendLog($"{controls.Channel.Name} monitor mute = {(isMuted ? "on" : "off")}");
-        }
-
-        if (ShouldApplyAppSessionVolume())
-        {
-            var processNames = GetProcessNamesForChannel(controls.Channel.Name).ToList();
-            if (processNames.Count > 0)
-            {
-                var results = audioSessionController.SetSessionMuteForProcesses(
-                    endpoints,
-                    processNames,
-                    controls.Channel.Name,
-                    isMuted);
-
-                LogSessionMuteResults(controls.Channel.Name, processNames, isMuted, results);
-
-                if (results.Any(result => result.Status == "Applied"))
-                {
-                    controls.Channel.IsMuted = isMuted;
-                    SetMuteUiValue(controls, isMuted);
-                    SetEndpointControlsEnabled(controls, enabled: true);
-                    SetStatus(controls, isMuted ? "Muted" : "Found");
-                    SaveSettings();
-                    RefreshAppSessions();
-                    return;
-                }
-            }
-        }
-
-        if (!ShouldApplyAppSessionVolume())
-        {
-            controls.Channel.IsMuted = isMuted;
-            SetMuteUiValue(controls, isMuted);
-            SetStatus(controls, isMuted ? "Muted" : "Found");
-            SaveSettings();
-            return;
-        }
-
-        var endpointId = controls.Channel.SelectedEndpointId;
-        if (string.IsNullOrWhiteSpace(endpointId))
-        {
-            AppendLog($"{controls.Channel.Name} mute ignored: no active routed app session and no endpoint selected.");
-            return;
-        }
-
-        try
-        {
-            audioEndpointController.SetMute(endpointId, isMuted);
-
-            controls.Channel.IsMuted = isMuted;
-            SetMuteUiValue(controls, isMuted);
-            SetEndpointControlsEnabled(controls, enabled: true);
-            SetStatus(controls, isMuted ? "Muted" : "Found");
-            AppendLog($"{controls.Channel.Name} mute = {(isMuted ? "on" : "off")}");
-            SaveSettings();
-        }
-        catch (Exception ex)
-        {
-            SetStatus(controls, "Error");
-            AppendLog($"{controls.Channel.Name} mute error: {ex.Message}");
-        }
+        settings.MonitorMix.ChannelMutes[controls.Channel.Name] = isMuted;
+        monitorMixEngine.SetChannelMute(controls.Channel.Name, isMuted);
+        controls.Channel.IsMuted = isMuted;
+        SetMuteUiValue(controls, isMuted);
+        SetStatus(controls, isMuted ? "Muted" : "Found");
+        AppendLog($"{controls.Channel.Name} monitor mute = {(isMuted ? "on" : "off")}");
+        SaveSettings();
     }
 
     private static void SetEndpointControlsEnabled(ChannelControls controls, bool enabled)
@@ -1924,7 +1865,7 @@ public partial class MainForm : Form
 
     private void MarkEndpointUnavailable(ChannelControls controls, string status)
     {
-        SetEndpointControlsEnabled(controls, enabled: false);
+        SetEndpointControlsEnabled(controls, enabled: true);
         SetStatus(controls, status);
     }
 
@@ -2851,14 +2792,12 @@ public partial class MainForm : Form
 
     private bool ShouldApplyAppSessionVolume()
     {
-        var mode = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
-        return mode is "Both" or "App Session Volume";
+        return false;
     }
 
     private bool ShouldApplyMonitorMixGain()
     {
-        var mode = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
-        return mode is "Both" or "Monitor Mix Gain";
+        return true;
     }
 
     private static string NormalizeProcessName(string processName)
