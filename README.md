@@ -1,6 +1,6 @@
 # AudioMixerVB
 
-AudioMixerVB is a Windows-only C# WinForms mixer for controlling four virtual audio endpoint volumes:
+AudioMixerVB is a Windows-only C# WinForms mixer for routing apps into four VB-CABLE channels and mixing them into separate Monitor and Stream mixes:
 
 - Game
 - Chat
@@ -66,7 +66,9 @@ The file is written next to the executable and stores:
 - channel volume mode
 - experimental/auto routing options
 - monitor mix output/input endpoints
-- monitor mix gains, mutes, latency, and slider mode
+- monitor mix master gain, channel gains, mutes, latency, and slider mode
+- stream mix output endpoint
+- stream mix master gain, channel gains, mutes, and latency
 - selected COM port
 - serial baud rate
 
@@ -177,7 +179,7 @@ Automatic routing writes the Windows per-app output preference. Some application
 
 `Auto apply` refreshes and applies routing rules every three seconds without repeating identical log messages.
 
-Endpoint volume control is still present as a fallback when no active routed application session matches a channel.
+The Mixer tab controls Monitor Mix gain. It does not change Windows app-session volume or VB-CABLE endpoint volume, because those source-level changes would affect both Monitor and Stream mixes.
 
 ### Automatic Routing Test
 
@@ -216,11 +218,11 @@ For the shared monitor mix, Windows `Listen to this device` is not required. It 
 
 Channel slider mode:
 
-- `App Session Volume`: channel sliders control matching app sessions through `ISimpleAudioVolume`.
-- `Monitor Mix Gain`: channel sliders control only the monitor mix gain.
-- `Both`: channel sliders control app session volume and monitor mix gain.
+- `Monitor Mix Gain`: channel sliders control only the Monitor Mix heard in headphones.
 
-`Both` is the default. Monitor gain is a 0.0-1.0 scalar and is not boosted above unity.
+`Monitor Mix Gain` is the default. Monitor gain is a 0.0-1.0 scalar and is not boosted above unity.
+
+AudioMixerVB keeps Monitor Mix gains separate from Stream Mix gains. App Session Volume changes Windows app volume before audio reaches both Monitor and Stream mixes, so it is not used by the Mixer tab when independent monitor/stream mixes are needed.
 
 ### Monitor Mix Test
 
@@ -245,6 +247,78 @@ Channel slider mode:
 7. Start Chrome audio and verify Media controls `CABLE-D`.
 8. Turn off Windows `Listen to this device` for VB-CABLE outputs if audio is doubled.
 
+## Stream Mix for OBS
+
+AudioMixerVB has two independent mixes:
+
+1. Monitor Mix goes to the user's headphones, Focusrite, or other physical monitoring output.
+2. Stream Mix goes to OBS through a separate unused virtual cable.
+
+Recommended channel routing:
+
+- Game -> `CABLE-A Input`
+- Chat -> `CABLE-B Input`
+- Music -> `CABLE-C Input`
+- Media -> `CABLE-D Input`
+
+Monitor Mix:
+
+- Captures `CABLE-A/B/C/D Output`
+- Outputs to `Speakers (Focusrite USB Audio)`, headphones, or another physical output
+
+Stream Mix:
+
+- Captures the same `CABLE-A/B/C/D Output` channel sources
+- Applies independent stream gains and mutes
+- Outputs to `CABLE Input (VB-Audio Virtual Cable)`
+
+Changing a Monitor Mix channel gain does not change the Stream Mix gain for that channel. Changing a Stream Mix channel gain does not change the Monitor Mix gain.
+
+OBS:
+
+1. Add Source -> Audio Input Capture.
+2. Select `CABLE Output (VB-Audio Virtual Cable)`.
+3. Disable Desktop Audio to avoid duplicated sound.
+
+Do not output Stream Mix to `CABLE-A Input`, `CABLE-B Input`, `CABLE-C Input`, or `CABLE-D Input`. Those render endpoints are already used as channel routing inputs and can create feedback or routing conflicts.
+
+Do not capture both Desktop Audio and Stream Mix in OBS. Viewers may hear the same audio twice.
+
+Do not enable Windows `Listen to this device` for VB-CABLE outputs while using AudioMixerVB monitoring.
+
+### Stream Mix Test
+
+1. Set channel render endpoints:
+   - Game -> `CABLE-A Input`
+   - Chat -> `CABLE-B Input`
+   - Music -> `CABLE-C Input`
+   - Media -> `CABLE-D Input`
+2. In Monitor Mix, select:
+   - Output = `Speakers (Focusrite USB Audio)` or another physical device
+   - Game input = `CABLE-A Output`
+   - Chat input = `CABLE-B Output`
+   - Music input = `CABLE-C Output`
+   - Media input = `CABLE-D Output`
+3. Click `Start Monitor`.
+4. In Stream Mix, select:
+   - Output = `CABLE Input (VB-Audio Virtual Cable)`
+   - Game input display = `CABLE-A Output`
+   - Chat input display = `CABLE-B Output`
+   - Music input display = `CABLE-C Output`
+   - Media input display = `CABLE-D Output`
+5. Click `Start Stream Mix`.
+6. In OBS, add `Audio Input Capture` and select `CABLE Output (VB-Audio Virtual Cable)`.
+7. Disable OBS Desktop Audio.
+8. Route `spotify.exe` to Music and start playback.
+9. The Music monitor slider changes headphone volume, and the Music stream slider changes OBS volume independently.
+
+Expected result:
+
+- The user hears Monitor Mix through the physical output.
+- OBS receives Stream Mix from `CABLE Output (VB-Audio Virtual Cable)`.
+- Changing Stream Music gain does not change headphone volume.
+- Changing Monitor Music gain does not change OBS volume.
+
 ## Important Limitations
 
 - AudioMixerVB controls the volume and mute state of selected Windows audio render endpoints.
@@ -252,5 +326,6 @@ Channel slider mode:
 - It does not create virtual audio devices.
 - It does not inject DLLs, hook processes, bypass anti-cheat software, or modify application processes directly.
 - Monitor Mix uses user-mode WASAPI capture/output through NAudio.
+- Stream Mix uses user-mode WASAPI capture/output through NAudio.
 - VB-Audio Cable creates the virtual devices.
 - For full monitoring, routing, or channel mixing, you may still need separate routing software such as Voicemeeter.

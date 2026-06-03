@@ -5,13 +5,17 @@ namespace AudioMixerVB;
 
 public partial class MainForm : Form
 {
+    private static readonly string[] StreamChannelNames = ["Game", "Chat", "Music", "Media"];
+
     private readonly AudioEndpointController audioEndpointController = new();
     private readonly AudioSessionController audioSessionController = new();
     private readonly MonitorMixEngine monitorMixEngine = new();
+    private readonly StreamMixEngine streamMixEngine = new();
     private readonly UndocumentedAudioPolicyRouter audioPolicyRouter = new();
     private readonly SettingsService settingsService = new();
     private readonly SerialController serialController = new();
     private readonly Dictionary<string, ChannelControls> channelControlsByName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, StreamChannelControls> streamChannelControlsByName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> lastAutoRoutingMessages = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<MixerChannel> channels;
 
@@ -22,7 +26,11 @@ public partial class MainForm : Form
     private IReadOnlyList<AudioAppGroup> appGroups = [];
     private bool updatingAppRoutingUi;
     private bool updatingMonitorUi;
+    private bool updatingStreamUi;
     private bool updatingSerialUi;
+    private bool monitorOperationInProgress;
+    private bool streamOperationInProgress;
+    private bool allowCloseAfterAudioStop;
 
     private GroupBox monitorMixGroupBox = null!;
     private TableLayoutPanel monitorMixLayout = null!;
@@ -38,6 +46,18 @@ public partial class MainForm : Form
     private Label monitorStatusValueLabel = null!;
     private Label monitorLatencyValueLabel = null!;
     private Label monitorWarningLabel = null!;
+    private GroupBox streamMixGroupBox = null!;
+    private TableLayoutPanel streamMixLayout = null!;
+    private TableLayoutPanel streamChannelsTable = null!;
+    private ComboBox streamOutputComboBox = null!;
+    private Button startStreamButton = null!;
+    private Button stopStreamButton = null!;
+    private Button restartStreamButton = null!;
+    private Label streamStatusValueLabel = null!;
+    private Label streamLatencyValueLabel = null!;
+    private NumericUpDown streamLatencyNumericUpDown = null!;
+    private Label streamWarningLabel = null!;
+    private ChannelStripControl streamMasterStripControl = null!;
     private ChannelStripControl masterStripControl = null!;
     private Button clearLogButton = null!;
     private Button copyLogButton = null!;
@@ -50,15 +70,20 @@ public partial class MainForm : Form
         audioSessionController.LogMessage += (_, message) => AppendLog(message);
         monitorMixEngine.OnLog += (_, message) => RunOnUiThread(() => AppendLog(message));
         monitorMixEngine.OnError += (_, ex) => RunOnUiThread(() => AppendLog($"Monitor error: {ex.Message}"));
+        streamMixEngine.OnLog += (_, message) => RunOnUiThread(() => AppendLog(message));
+        streamMixEngine.OnError += (_, ex) => RunOnUiThread(() => AppendLog($"Stream error: {ex.Message}"));
 
         settings = settingsService.Load(out var settingsFileLoaded, out var settingsError);
         channels = settings.Channels;
 
         BuildMonitorMixPanel();
+        BuildStreamMixPanel();
         SetupAppSessionsGrid();
         LoadRoutingOptions();
         BuildChannelPanels();
         BuildLogTools();
+        SetMonitorButtons(isRunning: false, operationInProgress: false);
+        SetStreamButtons(isRunning: false, operationInProgress: false);
         ApplyDarkTheme();
         WireEvents();
         LoadSerialSettings();
@@ -68,6 +93,11 @@ public partial class MainForm : Form
         if (settings.MonitorMix.EnabledOnStartup)
         {
             StartMonitor();
+        }
+
+        if (settings.StreamMix.EnabledOnStartup)
+        {
+            StartStreamMix();
         }
 
         AppendLog($"Settings path: {settingsService.SettingsPath}");
@@ -86,11 +116,56 @@ public partial class MainForm : Form
         }
     }
 
+    protected override async void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!allowCloseAfterAudioStop && ShouldStopAudioBeforeClose())
+        {
+            e.Cancel = true;
+            Enabled = false;
+            AppendLog("Stopping audio engines before close.");
+
+            await StopAudioBeforeCloseAsync();
+
+            allowCloseAfterAudioStop = true;
+            RunOnUiThread(Close);
+            return;
+        }
+
+        base.OnFormClosing(e);
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         monitorMixEngine.Dispose();
+        streamMixEngine.Dispose();
         serialController.Dispose();
         base.OnFormClosed(e);
+    }
+
+    private bool ShouldStopAudioBeforeClose()
+        => monitorMixEngine.IsRunning ||
+           monitorMixEngine.IsStopping ||
+           streamMixEngine.IsRunning ||
+           streamMixEngine.IsStopping;
+
+    private async Task StopAudioBeforeCloseAsync()
+    {
+        try
+        {
+            var stopTask = Task.WhenAll(monitorMixEngine.StopAsync(), streamMixEngine.StopAsync());
+            var completedTask = await Task.WhenAny(stopTask, Task.Delay(TimeSpan.FromSeconds(5)));
+            if (completedTask != stopTask)
+            {
+                AppendLog("Audio stop timed out during close; closing anyway.");
+                return;
+            }
+
+            await stopTask;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Audio stop during close error: {ex.Message}");
+        }
     }
 
     private void WireEvents()
@@ -102,9 +177,18 @@ public partial class MainForm : Form
         monitorMusicInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Music", monitorMusicInputComboBox);
         monitorMediaInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Media", monitorMediaInputComboBox);
         channelSliderModeComboBox.SelectedIndexChanged += (_, _) => HandleChannelSliderModeChanged();
+        masterStripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleMonitorMasterGainChanged();
+        masterStripControl.MuteButton.Click += (_, _) => ToggleMonitorMasterMute();
         startMonitorButton.Click += (_, _) => StartMonitor();
-        stopMonitorButton.Click += (_, _) => StopMonitor();
-        restartMonitorButton.Click += (_, _) => RestartMonitor();
+        stopMonitorButton.Click += async (_, _) => await StopMonitorAsync();
+        restartMonitorButton.Click += async (_, _) => await RestartMonitorAsync();
+        streamOutputComboBox.SelectedIndexChanged += (_, _) => HandleStreamOutputChanged();
+        streamLatencyNumericUpDown.ValueChanged += (_, _) => HandleStreamLatencyChanged();
+        streamMasterStripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleStreamMasterGainChanged();
+        streamMasterStripControl.MuteButton.Click += (_, _) => ToggleStreamMasterMute();
+        startStreamButton.Click += (_, _) => StartStreamMix();
+        stopStreamButton.Click += async (_, _) => await StopStreamMixAsync();
+        restartStreamButton.Click += async (_, _) => await RestartStreamMixAsync();
         refreshAppsButton.Click += (_, _) => RefreshAppSessions();
         applyRoutingButton.Click += (_, _) => ApplyRouting(autoTriggered: false);
         saveRoutingRulesButton.Click += (_, _) => SaveRoutingRulesFromGrid(persist: true);
@@ -204,7 +288,7 @@ public partial class MainForm : Form
         monitorMusicInputComboBox = CreateMonitorComboBox();
         monitorMediaInputComboBox = CreateMonitorComboBox();
         channelSliderModeComboBox = CreateMonitorComboBox();
-        channelSliderModeComboBox.Items.AddRange(["Both", "App Session Volume", "Monitor Mix Gain"]);
+        channelSliderModeComboBox.Items.AddRange(["Monitor Mix Gain"]);
 
         startMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Start Monitor", UseVisualStyleBackColor = true };
         stopMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Stop", UseVisualStyleBackColor = true };
@@ -233,6 +317,158 @@ public partial class MainForm : Form
         monitorMixGroupBox.Controls.Add(monitorMixLayout);
         monitorTabPage.Controls.Add(monitorMixGroupBox);
         monitorTabPage.ResumeLayout();
+    }
+
+    private void BuildStreamMixPanel()
+    {
+        streamTabPage.SuspendLayout();
+
+        streamMixGroupBox = new GroupBox
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(3),
+            Padding = new Padding(10),
+            Text = "Stream Mix for OBS"
+        };
+
+        var rootLayout = new TableLayoutPanel
+        {
+            ColumnCount = 1,
+            Dock = DockStyle.Fill,
+            RowCount = 3
+        };
+        rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 124F));
+        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54F));
+        rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        streamMixLayout = new TableLayoutPanel
+        {
+            ColumnCount = 6,
+            Dock = DockStyle.Fill,
+            RowCount = 3
+        };
+        streamMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82F));
+        streamMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        streamMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82F));
+        streamMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        streamMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112F));
+        streamMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112F));
+        for (var row = 0; row < 3; row++)
+        {
+            streamMixLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        }
+
+        streamOutputComboBox = CreateMonitorComboBox();
+        startStreamButton = new Button { Dock = DockStyle.Fill, Text = "Start Stream Mix", UseVisualStyleBackColor = true };
+        stopStreamButton = new Button { Dock = DockStyle.Fill, Text = "Stop", UseVisualStyleBackColor = true };
+        restartStreamButton = new Button { Dock = DockStyle.Fill, Text = "Restart", UseVisualStyleBackColor = true };
+        streamStatusValueLabel = new Label { Dock = DockStyle.Fill, Text = "Stopped", TextAlign = ContentAlignment.MiddleLeft };
+        streamLatencyValueLabel = new Label { Dock = DockStyle.Fill, Text = $"{settings.StreamMix.LatencyMs} ms", TextAlign = ContentAlignment.MiddleLeft };
+        streamLatencyNumericUpDown = new NumericUpDown
+        {
+            Dock = DockStyle.Fill,
+            Minimum = 20,
+            Maximum = 500,
+            Increment = 5,
+            Value = settings.StreamMix.LatencyMs
+        };
+        streamWarningLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            ForeColor = Color.DarkOrange,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        AddStreamRow(0, "Output", streamOutputComboBox, "Status", streamStatusValueLabel);
+        AddStreamRow(1, "Latency", streamLatencyNumericUpDown, "Value", streamLatencyValueLabel);
+        streamMixLayout.Controls.Add(startStreamButton, 0, 2);
+        streamMixLayout.SetColumnSpan(startStreamButton, 2);
+        streamMixLayout.Controls.Add(stopStreamButton, 2, 2);
+        streamMixLayout.Controls.Add(restartStreamButton, 3, 2);
+
+        rootLayout.Controls.Add(streamMixLayout, 0, 0);
+        rootLayout.Controls.Add(streamWarningLabel, 0, 1);
+
+        streamChannelsTable = new TableLayoutPanel
+        {
+            ColumnCount = StreamChannelNames.Length + 1,
+            Dock = DockStyle.Fill,
+            RowCount = 1
+        };
+        streamChannelsTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        for (var column = 0; column < streamChannelsTable.ColumnCount; column++)
+        {
+            streamChannelsTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F / streamChannelsTable.ColumnCount));
+        }
+
+        streamMasterStripControl = new ChannelStripControl
+        {
+            ChannelName = "Stream Master",
+            AccentColor = Color.FromArgb(86, 169, 255),
+            EndpointComboBoxVisible = false,
+            VolumePercent = GainToPercent(settings.StreamMix.MasterGain),
+            IsMuted = settings.StreamMix.MasterMuted
+        };
+        streamMasterStripControl.SetEndpointControlsEnabled(enabled: true);
+        streamMasterStripControl.SetStatus("No output", Color.FromArgb(190, 196, 205));
+        streamChannelsTable.Controls.Add(streamMasterStripControl, 0, 0);
+
+        for (var index = 0; index < StreamChannelNames.Length; index++)
+        {
+            var controls = CreateStreamChannelControls(StreamChannelNames[index]);
+            streamChannelControlsByName[controls.ChannelName] = controls;
+            streamChannelsTable.Controls.Add(controls.StripControl, index + 1, 0);
+        }
+
+        rootLayout.Controls.Add(streamChannelsTable, 0, 2);
+        streamMixGroupBox.Controls.Add(rootLayout);
+        streamTabPage.Controls.Add(streamMixGroupBox);
+        streamTabPage.ResumeLayout();
+    }
+
+    private void AddStreamRow(
+        int row,
+        string leftLabel,
+        Control leftControl,
+        string rightLabel,
+        Control rightControl)
+    {
+        streamMixLayout.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = leftLabel,
+            TextAlign = ContentAlignment.MiddleLeft
+        }, 0, row);
+        streamMixLayout.Controls.Add(leftControl, 1, row);
+        streamMixLayout.SetColumnSpan(leftControl, 3);
+        streamMixLayout.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = rightLabel,
+            TextAlign = ContentAlignment.MiddleLeft
+        }, 4, row);
+        streamMixLayout.Controls.Add(rightControl, 5, row);
+    }
+
+    private StreamChannelControls CreateStreamChannelControls(string channelName)
+    {
+        var stripControl = new ChannelStripControl
+        {
+            ChannelName = channelName,
+            AccentColor = GetChannelAccentColor(channelName),
+            EndpointComboBoxVisible = false,
+            VolumePercent = GainToPercent(settings.StreamMix.ChannelGains.GetValueOrDefault(channelName, 1.0f)),
+            IsMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(channelName)
+        };
+        stripControl.SetEndpointControlsEnabled(enabled: true);
+        stripControl.SetStatus("No input", Color.FromArgb(190, 196, 205));
+
+        var controls = new StreamChannelControls(channelName, stripControl);
+        stripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleStreamChannelGainChanged(controls);
+        stripControl.MuteButton.Click += (_, _) => ToggleStreamChannelMute(controls);
+
+        return controls;
     }
 
     private static ComboBox CreateMonitorComboBox()
@@ -371,6 +607,10 @@ public partial class MainForm : Form
                 textBox.BackColor = Color.FromArgb(19, 21, 25);
                 textBox.ForeColor = Color.Gainsboro;
                 break;
+            case NumericUpDown numericUpDown:
+                numericUpDown.BackColor = Color.FromArgb(38, 42, 50);
+                numericUpDown.ForeColor = Color.WhiteSmoke;
+                break;
             case ComboBox comboBox:
                 comboBox.BackColor = Color.FromArgb(38, 42, 50);
                 comboBox.ForeColor = Color.WhiteSmoke;
@@ -404,13 +644,13 @@ public partial class MainForm : Form
 
         masterStripControl = new ChannelStripControl
         {
-            ChannelName = "Master",
+            ChannelName = "Monitor Master",
             AccentColor = Color.FromArgb(86, 169, 255),
             EndpointComboBoxVisible = false,
-            VolumePercent = 100,
-            IsMuted = false
+            VolumePercent = GainToPercent(settings.MonitorMix.MasterGain),
+            IsMuted = settings.MonitorMix.MasterMuted
         };
-        masterStripControl.SetEndpointControlsEnabled(enabled: false);
+        masterStripControl.SetEndpointControlsEnabled(enabled: true);
         masterStripControl.SetStatus("No output", Color.FromArgb(190, 196, 205));
         channelsTable.Controls.Add(masterStripControl, 0, 0);
 
@@ -433,8 +673,8 @@ public partial class MainForm : Form
         var stripControl = new ChannelStripControl
         {
             ChannelName = channel.Name,
-            VolumePercent = Math.Clamp(channel.VolumePercent, 0, 100),
-            IsMuted = channel.IsMuted
+            VolumePercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(channel.Name, 0.5f)),
+            IsMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(channel.Name)
         };
 
         var controls = new ChannelControls(channel, stripControl);
@@ -485,10 +725,23 @@ public partial class MainForm : Form
                 ? PeakToPercent(peak)
                 : 0;
         }
+
+        if (streamMasterStripControl is not null)
+        {
+            streamMasterStripControl.VuMeter.Value = PeakToPercent(streamMixEngine.GetMasterPeak());
+        }
+
+        foreach (var controls in streamChannelControlsByName.Values)
+        {
+            controls.StripControl.VuMeter.Value = PeakToPercent(streamMixEngine.GetChannelPeak(controls.ChannelName));
+        }
     }
 
     private static int PeakToPercent(float peak)
         => Math.Clamp((int)Math.Round(Math.Clamp(peak, 0f, 1f) * 100f, MidpointRounding.AwayFromZero), 0, 100);
+
+    private static int GainToPercent(float gain)
+        => Math.Clamp((int)Math.Round(Math.Clamp(gain, 0f, 1f) * 100f, MidpointRounding.AwayFromZero), 0, 100);
 
     private void RefreshEndpoints(bool applyFirstRunAutoMapping)
     {
@@ -515,8 +768,11 @@ public partial class MainForm : Form
                 ApplyFirstRunMonitorMapping();
             }
 
+            ApplyMissingStreamDefaults();
+
             RefreshEndpointComboBoxes();
             RefreshMonitorDeviceComboBoxes();
+            RefreshStreamDeviceComboBoxes();
             UpdateChannelControlAvailability();
             SaveSettings();
         }
@@ -551,6 +807,25 @@ public partial class MainForm : Form
             settings.MonitorMix.SetCaptureEndpoint(channelName, match);
             AppendLog($"Auto-mapped monitor {channelName} input to {match.FriendlyName}.");
         }
+    }
+
+    private void ApplyMissingStreamDefaults()
+    {
+        if (!string.IsNullOrWhiteSpace(settings.StreamMix.OutputEndpointId) ||
+            !string.IsNullOrWhiteSpace(settings.StreamMix.OutputEndpointFriendlyName))
+        {
+            return;
+        }
+
+        var recommendedOutput = FindRecommendedStreamOutputEndpoint();
+        if (recommendedOutput is null)
+        {
+            return;
+        }
+
+        settings.StreamMix.OutputEndpointId = recommendedOutput.Id;
+        settings.StreamMix.OutputEndpointFriendlyName = recommendedOutput.FriendlyName;
+        AppendLog($"Auto-mapped stream output to {recommendedOutput.FriendlyName}.");
     }
 
     private AudioEndpoint? FindDefaultCaptureEndpointForChannel(string channelName)
@@ -648,11 +923,28 @@ public partial class MainForm : Form
 
         channelSliderModeComboBox.SelectedItem = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
         monitorLatencyValueLabel.Text = $"{settings.MonitorMix.LatencyMs} ms";
+        SyncMonitorMixControlsFromSettings();
         updatingMonitorUi = false;
 
         ApplyMonitorSettingsToEngine();
         UpdateMonitorWarning();
         UpdateMasterStripSummary();
+    }
+
+    private void SyncMonitorMixControlsFromSettings()
+    {
+        masterStripControl.VolumePercent = GainToPercent(settings.MonitorMix.MasterGain);
+        masterStripControl.IsMuted = settings.MonitorMix.MasterMuted;
+
+        foreach (var controls in channelControlsByName.Values)
+        {
+            var volumePercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(controls.Channel.Name, 0.5f));
+            var isMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
+            controls.Channel.VolumePercent = volumePercent;
+            controls.Channel.IsMuted = isMuted;
+            SetVolumeUiValue(controls, volumePercent);
+            SetMuteUiValue(controls, isMuted);
+        }
     }
 
     private void PopulateMonitorOutputComboBox()
@@ -741,6 +1033,86 @@ public partial class MainForm : Form
         return null;
     }
 
+    private void RefreshStreamDeviceComboBoxes()
+    {
+        updatingStreamUi = true;
+        PopulateStreamOutputComboBox();
+        streamLatencyNumericUpDown.Value = Math.Clamp(settings.StreamMix.LatencyMs, 20, 500);
+        streamLatencyValueLabel.Text = $"{settings.StreamMix.LatencyMs} ms";
+        streamMasterStripControl.VolumePercent = GainToPercent(settings.StreamMix.MasterGain);
+        streamMasterStripControl.IsMuted = settings.StreamMix.MasterMuted;
+
+        foreach (var controls in streamChannelControlsByName.Values)
+        {
+            controls.IsUpdating = true;
+            controls.StripControl.VolumePercent = GainToPercent(
+                settings.StreamMix.ChannelGains.GetValueOrDefault(controls.ChannelName, 1.0f));
+            controls.StripControl.IsMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.ChannelName);
+            controls.IsUpdating = false;
+        }
+
+        updatingStreamUi = false;
+
+        ApplyStreamSettingsToEngine();
+        UpdateStreamWarning();
+        UpdateStreamMasterStripSummary();
+        UpdateStreamCaptureDisplays();
+    }
+
+    private void PopulateStreamOutputComboBox()
+    {
+        streamOutputComboBox.BeginUpdate();
+        streamOutputComboBox.Items.Clear();
+        streamOutputComboBox.Items.Add(EndpointChoice.Empty);
+
+        foreach (var endpoint in endpoints)
+        {
+            streamOutputComboBox.Items.Add(new EndpointChoice(endpoint));
+        }
+
+        var selectedEndpoint = FindStreamOutputEndpoint();
+        streamOutputComboBox.SelectedItem = selectedEndpoint is null
+            ? EndpointChoice.Empty
+            : FindChoice(streamOutputComboBox, selectedEndpoint.Id);
+        streamOutputComboBox.EndUpdate();
+    }
+
+    private AudioEndpoint? FindStreamOutputEndpoint()
+    {
+        if (!string.IsNullOrWhiteSpace(settings.StreamMix.OutputEndpointId))
+        {
+            var byId = endpoints.FirstOrDefault(endpoint =>
+                endpoint.Id.Equals(settings.StreamMix.OutputEndpointId, StringComparison.OrdinalIgnoreCase));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.StreamMix.OutputEndpointFriendlyName))
+        {
+            return endpoints.FirstOrDefault(endpoint =>
+                endpoint.FriendlyName.Equals(settings.StreamMix.OutputEndpointFriendlyName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return null;
+    }
+
+    private AudioEndpoint? FindStreamCaptureEndpoint(string channelName)
+        => FindDefaultCaptureEndpointForChannel(channelName);
+
+    private AudioEndpoint? FindRecommendedStreamOutputEndpoint()
+    {
+        return endpoints.FirstOrDefault(IsRecommendedStreamOutputEndpoint)
+            ?? endpoints.FirstOrDefault(endpoint =>
+                !IsChannelCableEndpoint(endpoint) &&
+                endpoint.FriendlyName.Contains("VB-Audio Virtual Cable", StringComparison.OrdinalIgnoreCase) &&
+                endpoint.FriendlyName.Contains("Input", StringComparison.OrdinalIgnoreCase))
+            ?? endpoints.FirstOrDefault(endpoint =>
+                !IsChannelCableEndpoint(endpoint) &&
+                endpoint.FriendlyName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase));
+    }
+
     private void HandleMonitorOutputChanged()
     {
         if (updatingMonitorUi)
@@ -780,6 +1152,30 @@ public partial class MainForm : Form
         }
     }
 
+    private void HandleMonitorMasterGainChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        var volumePercent = masterStripControl.VolumeTrackBar.Value;
+        settings.MonitorMix.MasterGain = volumePercent / 100f;
+        SetMonitorMasterVolumeUiValue(volumePercent);
+        monitorMixEngine.SetMasterGain(settings.MonitorMix.MasterGain);
+        SaveSettings();
+        AppendLog($"Monitor master gain = {volumePercent}%");
+    }
+
+    private void ToggleMonitorMasterMute()
+    {
+        settings.MonitorMix.MasterMuted = !settings.MonitorMix.MasterMuted;
+        monitorMixEngine.SetMasterMute(settings.MonitorMix.MasterMuted);
+        SetMonitorMasterMuteUiValue(settings.MonitorMix.MasterMuted);
+        SaveSettings();
+        AppendLog($"Monitor master mute = {(settings.MonitorMix.MasterMuted ? "on" : "off")}");
+    }
+
     private void HandleChannelSliderModeChanged()
     {
         if (updatingMonitorUi)
@@ -787,9 +1183,21 @@ public partial class MainForm : Form
             return;
         }
 
-        settings.MonitorMix.ChannelSliderMode = channelSliderModeComboBox.SelectedItem?.ToString() ?? "Monitor Mix Gain";
+        settings.MonitorMix.ChannelSliderMode = NormalizeSliderMode(channelSliderModeComboBox.SelectedItem?.ToString());
         SaveSettings();
         AppendLog($"Channel slider mode = {settings.MonitorMix.ChannelSliderMode}");
+    }
+
+    private void SetMonitorMasterVolumeUiValue(int volumePercent)
+    {
+        updatingMonitorUi = true;
+        masterStripControl.VolumePercent = volumePercent;
+        updatingMonitorUi = false;
+    }
+
+    private void SetMonitorMasterMuteUiValue(bool isMuted)
+    {
+        masterStripControl.IsMuted = isMuted;
     }
 
     private void ApplyMonitorSettingsToEngine()
@@ -803,17 +1211,25 @@ public partial class MainForm : Form
             var endpointId = settings.MonitorMix.GetCaptureEndpointId(channelName);
             monitorMixEngine.SetChannelInput(channelName, endpointId ?? string.Empty);
 
-            monitorMixEngine.SetChannelVolume(
+            monitorMixEngine.SetChannelGain(
                 channelName,
                 settings.MonitorMix.ChannelGains.GetValueOrDefault(channelName, 0.5f));
             monitorMixEngine.SetChannelMute(
                 channelName,
                 settings.MonitorMix.ChannelMutes.GetValueOrDefault(channelName));
         }
+
+        monitorMixEngine.SetMasterGain(settings.MonitorMix.MasterGain);
+        monitorMixEngine.SetMasterMute(settings.MonitorMix.MasterMuted);
     }
 
     private void StartMonitor()
     {
+        if (monitorOperationInProgress)
+        {
+            return;
+        }
+
         try
         {
             ValidateMonitorSelection();
@@ -821,30 +1237,67 @@ public partial class MainForm : Form
             monitorMixEngine.Start();
             monitorStatusValueLabel.Text = "Running";
             monitorStatusValueLabel.ForeColor = Color.ForestGreen;
+            SetMonitorButtons(isRunning: true, operationInProgress: false);
             SaveSettings();
         }
         catch (Exception ex)
         {
             monitorStatusValueLabel.Text = "Error";
             monitorStatusValueLabel.ForeColor = Color.Firebrick;
+            SetMonitorButtons(isRunning: monitorMixEngine.IsRunning, operationInProgress: false);
             AppendLog($"Monitor start error: {ex.Message}");
         }
     }
 
-    private void StopMonitor()
+    private async Task StopMonitorAsync()
     {
-        monitorMixEngine.Stop();
-        monitorStatusValueLabel.Text = "Stopped";
-        monitorStatusValueLabel.ForeColor = Color.DimGray;
+        if (monitorOperationInProgress)
+        {
+            return;
+        }
+
+        monitorOperationInProgress = true;
+        monitorStatusValueLabel.Text = "Stopping...";
+        monitorStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetMonitorButtons(isRunning: true, operationInProgress: true);
+
+        try
+        {
+            await monitorMixEngine.StopAsync();
+            monitorStatusValueLabel.Text = "Stopped";
+            monitorStatusValueLabel.ForeColor = Color.DimGray;
+        }
+        catch (Exception ex)
+        {
+            monitorStatusValueLabel.Text = "Error";
+            monitorStatusValueLabel.ForeColor = Color.Firebrick;
+            AppendLog($"Monitor stop error: {ex.Message}");
+        }
+        finally
+        {
+            monitorOperationInProgress = false;
+            SetMonitorButtons(isRunning: monitorMixEngine.IsRunning, operationInProgress: false);
+        }
     }
 
-    private void RestartMonitor()
+    private async Task RestartMonitorAsync()
     {
+        if (monitorOperationInProgress)
+        {
+            return;
+        }
+
+        monitorOperationInProgress = true;
+        monitorStatusValueLabel.Text = "Restarting...";
+        monitorStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetMonitorButtons(isRunning: true, operationInProgress: true);
+
         try
         {
             ValidateMonitorSelection();
+            await monitorMixEngine.StopAsync();
             ApplyMonitorSettingsToEngine();
-            monitorMixEngine.Restart();
+            monitorMixEngine.Start();
             monitorStatusValueLabel.Text = "Running";
             monitorStatusValueLabel.ForeColor = Color.ForestGreen;
         }
@@ -854,6 +1307,18 @@ public partial class MainForm : Form
             monitorStatusValueLabel.ForeColor = Color.Firebrick;
             AppendLog($"Monitor restart error: {ex.Message}");
         }
+        finally
+        {
+            monitorOperationInProgress = false;
+            SetMonitorButtons(isRunning: monitorMixEngine.IsRunning, operationInProgress: false);
+        }
+    }
+
+    private void SetMonitorButtons(bool isRunning, bool operationInProgress)
+    {
+        startMonitorButton.Enabled = !operationInProgress && !isRunning;
+        stopMonitorButton.Enabled = !operationInProgress && isRunning;
+        restartMonitorButton.Enabled = !operationInProgress;
     }
 
     private void ValidateMonitorSelection()
@@ -886,21 +1351,357 @@ public partial class MainForm : Form
             : Color.FromArgb(190, 196, 205);
         monitorWarningLabel.Text = output is not null && IsVbCableEndpoint(output)
             ? "Do not monitor into a VB-CABLE endpoint. This may create feedback loop."
-            : "Use a physical output device. Disable Windows 'Listen to this device' on VB-CABLE outputs to avoid doubled audio.";
+            : "Mixer tab controls Monitor Mix only. App Session Volume changes Windows app volume before both Monitor and Stream mixes; use Monitor/Stream gains for independent mixes.";
+    }
+
+    private void HandleStreamOutputChanged()
+    {
+        if (updatingStreamUi)
+        {
+            return;
+        }
+
+        var endpoint = (streamOutputComboBox.SelectedItem as EndpointChoice)?.Endpoint;
+        settings.StreamMix.OutputEndpointId = endpoint?.Id;
+        settings.StreamMix.OutputEndpointFriendlyName = endpoint?.FriendlyName;
+        ApplyStreamSettingsToEngine();
+        UpdateStreamWarning();
+        UpdateStreamMasterStripSummary();
+        SaveSettings();
+
+        if (endpoint is not null)
+        {
+            AppendLog($"Stream output = {endpoint.FriendlyName}");
+        }
+    }
+
+    private void HandleStreamLatencyChanged()
+    {
+        if (updatingStreamUi)
+        {
+            return;
+        }
+
+        settings.StreamMix.LatencyMs = (int)streamLatencyNumericUpDown.Value;
+        streamLatencyValueLabel.Text = $"{settings.StreamMix.LatencyMs} ms";
+        streamMixEngine.LatencyMs = settings.StreamMix.LatencyMs;
+        SaveSettings();
+
+        if (streamMixEngine.IsRunning)
+        {
+            AppendLog("Stream latency updated. Restart Stream Mix to apply it to the active WASAPI output.");
+        }
+    }
+
+    private void HandleStreamMasterGainChanged()
+    {
+        if (updatingStreamUi)
+        {
+            return;
+        }
+
+        var volumePercent = streamMasterStripControl.VolumeTrackBar.Value;
+        settings.StreamMix.MasterGain = volumePercent / 100f;
+        SetStreamMasterVolumeUiValue(volumePercent);
+        streamMixEngine.SetMasterGain(settings.StreamMix.MasterGain);
+        SaveSettings();
+        AppendLog($"Stream master gain = {volumePercent}%");
+    }
+
+    private void ToggleStreamMasterMute()
+    {
+        settings.StreamMix.MasterMuted = !settings.StreamMix.MasterMuted;
+        streamMixEngine.SetMasterMute(settings.StreamMix.MasterMuted);
+        SetStreamMasterMuteUiValue(settings.StreamMix.MasterMuted);
+        SaveSettings();
+        AppendLog($"Stream master mute = {(settings.StreamMix.MasterMuted ? "on" : "off")}");
+    }
+
+    private void HandleStreamChannelGainChanged(StreamChannelControls controls)
+    {
+        if (updatingStreamUi || controls.IsUpdating)
+        {
+            return;
+        }
+
+        ApplyStreamChannelGain(controls, controls.StripControl.VolumeTrackBar.Value);
+    }
+
+    private void ApplyStreamChannelGain(StreamChannelControls controls, int volumePercent)
+    {
+        volumePercent = Math.Clamp(volumePercent, 0, 100);
+        var gain = volumePercent / 100f;
+        settings.StreamMix.ChannelGains[controls.ChannelName] = gain;
+        SetStreamChannelVolumeUiValue(controls, volumePercent);
+        streamMixEngine.SetChannelGain(controls.ChannelName, gain);
+        SaveSettings();
+        AppendLog($"{controls.ChannelName} stream gain = {volumePercent}%");
+    }
+
+    private void ToggleStreamChannelMute(StreamChannelControls controls)
+    {
+        var isMuted = !settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.ChannelName);
+        settings.StreamMix.ChannelMutes[controls.ChannelName] = isMuted;
+        streamMixEngine.SetChannelMute(controls.ChannelName, isMuted);
+        SetStreamChannelMuteUiValue(controls, isMuted);
+        SaveSettings();
+        AppendLog($"{controls.ChannelName} stream mute = {(isMuted ? "on" : "off")}");
+    }
+
+    private void ApplyStreamSettingsToEngine()
+    {
+        streamMixEngine.LatencyMs = settings.StreamMix.LatencyMs;
+
+        var outputEndpoint = FindStreamOutputEndpoint();
+        streamMixEngine.SetOutputDevice(outputEndpoint?.Id ?? string.Empty);
+
+        foreach (var channelName in StreamChannelNames)
+        {
+            var endpointId = FindStreamCaptureEndpoint(channelName)?.Id;
+            streamMixEngine.SetChannelInput(channelName, endpointId ?? string.Empty);
+            streamMixEngine.SetChannelGain(
+                channelName,
+                settings.StreamMix.ChannelGains.GetValueOrDefault(channelName, 1.0f));
+            streamMixEngine.SetChannelMute(
+                channelName,
+                settings.StreamMix.ChannelMutes.GetValueOrDefault(channelName));
+        }
+
+        streamMixEngine.SetMasterGain(settings.StreamMix.MasterGain);
+        streamMixEngine.SetMasterMute(settings.StreamMix.MasterMuted);
+    }
+
+    private void StartStreamMix()
+    {
+        if (streamOperationInProgress)
+        {
+            return;
+        }
+
+        try
+        {
+            ValidateStreamSelection();
+            ApplyStreamSettingsToEngine();
+            streamMixEngine.Start();
+            streamStatusValueLabel.Text = "Running";
+            streamStatusValueLabel.ForeColor = Color.ForestGreen;
+            SetStreamButtons(isRunning: true, operationInProgress: false);
+            SaveSettings();
+        }
+        catch (Exception ex)
+        {
+            streamStatusValueLabel.Text = "Error";
+            streamStatusValueLabel.ForeColor = Color.Firebrick;
+            SetStreamButtons(isRunning: streamMixEngine.IsRunning, operationInProgress: false);
+            AppendLog($"Stream start error: {ex.Message}");
+        }
+    }
+
+    private async Task StopStreamMixAsync()
+    {
+        if (streamOperationInProgress)
+        {
+            return;
+        }
+
+        streamOperationInProgress = true;
+        streamStatusValueLabel.Text = "Stopping...";
+        streamStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetStreamButtons(isRunning: true, operationInProgress: true);
+
+        try
+        {
+            await streamMixEngine.StopAsync();
+            streamStatusValueLabel.Text = "Stopped";
+            streamStatusValueLabel.ForeColor = Color.DimGray;
+        }
+        catch (Exception ex)
+        {
+            streamStatusValueLabel.Text = "Error";
+            streamStatusValueLabel.ForeColor = Color.Firebrick;
+            AppendLog($"Stream stop error: {ex.Message}");
+        }
+        finally
+        {
+            streamOperationInProgress = false;
+            SetStreamButtons(isRunning: streamMixEngine.IsRunning, operationInProgress: false);
+        }
+    }
+
+    private async Task RestartStreamMixAsync()
+    {
+        if (streamOperationInProgress)
+        {
+            return;
+        }
+
+        streamOperationInProgress = true;
+        streamStatusValueLabel.Text = "Restarting...";
+        streamStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetStreamButtons(isRunning: true, operationInProgress: true);
+
+        try
+        {
+            ValidateStreamSelection();
+            await streamMixEngine.StopAsync();
+            ApplyStreamSettingsToEngine();
+            streamMixEngine.Start();
+            streamStatusValueLabel.Text = "Running";
+            streamStatusValueLabel.ForeColor = Color.ForestGreen;
+        }
+        catch (Exception ex)
+        {
+            streamStatusValueLabel.Text = "Error";
+            streamStatusValueLabel.ForeColor = Color.Firebrick;
+            AppendLog($"Stream restart error: {ex.Message}");
+        }
+        finally
+        {
+            streamOperationInProgress = false;
+            SetStreamButtons(isRunning: streamMixEngine.IsRunning, operationInProgress: false);
+        }
+    }
+
+    private void SetStreamButtons(bool isRunning, bool operationInProgress)
+    {
+        startStreamButton.Enabled = !operationInProgress && !isRunning;
+        stopStreamButton.Enabled = !operationInProgress && isRunning;
+        restartStreamButton.Enabled = !operationInProgress;
+    }
+
+    private void ValidateStreamSelection()
+    {
+        var output = FindStreamOutputEndpoint();
+        if (output is null)
+        {
+            throw new InvalidOperationException("Select an unused virtual cable output for OBS, for example CABLE Input.");
+        }
+
+        if (IsChannelCableEndpoint(output))
+        {
+            throw new InvalidOperationException("Do not output Stream Mix into a channel cable. This may create feedback or routing conflicts.");
+        }
+
+        foreach (var channelName in StreamChannelNames)
+        {
+            if (FindStreamCaptureEndpoint(channelName) is null)
+            {
+                throw new InvalidOperationException($"Stream input for {channelName} was not found.");
+            }
+        }
+    }
+
+    private void UpdateStreamWarning()
+    {
+        var output = FindStreamOutputEndpoint();
+        if (output is null)
+        {
+            streamWarningLabel.ForeColor = Color.DarkOrange;
+            streamWarningLabel.Text = "Select an unused virtual cable output for OBS, for example CABLE Input.";
+            SetStreamIdleStatus("Stopped", Color.DimGray);
+            return;
+        }
+
+        if (IsChannelCableEndpoint(output))
+        {
+            streamWarningLabel.ForeColor = Color.Firebrick;
+            streamWarningLabel.Text = "Do not output Stream Mix into a channel cable. This may create feedback or routing conflicts.";
+            SetStreamIdleStatus("Unsafe output selected", Color.Firebrick);
+            return;
+        }
+
+        if (IsRecommendedStreamOutputEndpoint(output))
+        {
+            streamWarningLabel.ForeColor = Color.ForestGreen;
+            streamWarningLabel.Text = "Recommended OBS stream output selected. In OBS, capture CABLE Output (VB-Audio Virtual Cable) and disable Desktop Audio.";
+            SetStreamIdleStatus("Recommended OBS stream output selected.", Color.ForestGreen);
+            return;
+        }
+
+        streamWarningLabel.ForeColor = Color.DarkOrange;
+        streamWarningLabel.Text = "OBS should capture CABLE Output (VB-Audio Virtual Cable). Do not use CABLE-A/B/C/D Input for Stream Mix, and disable Desktop Audio in OBS.";
+        SetStreamIdleStatus("Custom output selected", Color.DarkOrange);
+    }
+
+    private void SetStreamIdleStatus(string text, Color color)
+    {
+        if (streamMixEngine.IsRunning)
+        {
+            return;
+        }
+
+        streamStatusValueLabel.Text = text;
+        streamStatusValueLabel.ForeColor = color;
+    }
+
+    private void UpdateStreamMasterStripSummary()
+    {
+        var output = FindStreamOutputEndpoint();
+        streamMasterStripControl.SetStatus(
+            output?.FriendlyName ?? "No output",
+            output is null ? Color.FromArgb(190, 196, 205) : Color.FromArgb(130, 210, 255));
+    }
+
+    private void UpdateStreamCaptureDisplays()
+    {
+        foreach (var controls in streamChannelControlsByName.Values)
+        {
+            var input = FindStreamCaptureEndpoint(controls.ChannelName);
+            controls.StripControl.SetStatus(
+                input?.FriendlyName ?? "Input not found",
+                input is null ? Color.Firebrick : Color.FromArgb(130, 210, 255));
+        }
+    }
+
+    private void SetStreamMasterVolumeUiValue(int volumePercent)
+    {
+        updatingStreamUi = true;
+        streamMasterStripControl.VolumePercent = volumePercent;
+        updatingStreamUi = false;
+    }
+
+    private void SetStreamMasterMuteUiValue(bool isMuted)
+    {
+        streamMasterStripControl.IsMuted = isMuted;
+    }
+
+    private static void SetStreamChannelVolumeUiValue(StreamChannelControls controls, int volumePercent)
+    {
+        controls.IsUpdating = true;
+        controls.StripControl.VolumePercent = volumePercent;
+        controls.IsUpdating = false;
+    }
+
+    private static void SetStreamChannelMuteUiValue(StreamChannelControls controls, bool isMuted)
+    {
+        controls.StripControl.IsMuted = isMuted;
     }
 
     private static bool IsVbCableEndpoint(AudioEndpoint endpoint)
         => endpoint.FriendlyName.Contains("CABLE", StringComparison.OrdinalIgnoreCase) ||
            endpoint.FriendlyName.Contains("VB-Audio", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsRecommendedStreamOutputEndpoint(AudioEndpoint endpoint)
+        => !IsChannelCableEndpoint(endpoint) &&
+           endpoint.FriendlyName.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase) &&
+           endpoint.FriendlyName.Contains("VB-Audio", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsChannelCableEndpoint(AudioEndpoint endpoint)
+    {
+        var name = endpoint.FriendlyName;
+        return name.Contains("CABLE-A", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("CABLE-B", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("CABLE-C", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("CABLE-D", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("Cable A", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("Cable B", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("Cable C", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("Cable D", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string NormalizeSliderMode(string? mode)
     {
-        return mode switch
-        {
-            "App Session Volume" => "App Session Volume",
-            "Monitor Mix Gain" => "Monitor Mix Gain",
-            _ => "Both"
-        };
+        return "Monitor Mix Gain";
     }
 
     private AudioEndpoint? FindSelectedEndpoint(MixerChannel channel)
@@ -965,22 +1766,23 @@ public partial class MainForm : Form
 
         try
         {
-            var isMuted = audioEndpointController.GetMute(endpointId);
-
-            controls.Channel.IsMuted = isMuted;
-            if (!IsApplicationSessionMode())
+            if (!endpoints.Any(endpoint => endpoint.Id.Equals(endpointId, StringComparison.OrdinalIgnoreCase)))
             {
-                controls.Channel.VolumePercent = audioEndpointController.GetVolumePercent(endpointId);
+                throw new InvalidOperationException("Selected endpoint is not active.");
             }
 
-            SetVolumeUiValue(controls, controls.Channel.VolumePercent);
+            var volumePercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(controls.Channel.Name, 0.5f));
+            var isMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
+            controls.Channel.VolumePercent = volumePercent;
+            controls.Channel.IsMuted = isMuted;
+            SetVolumeUiValue(controls, volumePercent);
             SetMuteUiValue(controls, isMuted);
             SetEndpointControlsEnabled(controls, enabled: true);
             SetStatus(controls, isMuted ? "Muted" : "Found");
         }
         catch (Exception ex)
         {
-            SetEndpointControlsEnabled(controls, enabled: false);
+            SetEndpointControlsEnabled(controls, enabled: true);
             SetStatus(controls, "Error");
 
             if (logErrors)
@@ -1006,45 +1808,11 @@ public partial class MainForm : Form
         controls.Channel.VolumePercent = volumePercent;
         SetVolumeUiValue(controls, volumePercent);
 
-        if (ShouldApplyMonitorMixGain())
-        {
-            var gain = volumePercent / 100f;
-            settings.MonitorMix.ChannelGains[controls.Channel.Name] = gain;
-            monitorMixEngine.SetChannelVolume(controls.Channel.Name, gain);
-            AppendLog($"{controls.Channel.Name} monitor gain = {volumePercent}%");
-        }
-
-        if (ShouldApplyAppSessionVolume())
-        {
-            var processNames = GetProcessNamesForChannel(controls.Channel.Name).ToList();
-            if (processNames.Count > 0)
-            {
-                var results = audioSessionController.SetSessionVolumeForProcesses(
-                    endpoints,
-                    processNames,
-                    controls.Channel.Name,
-                    volumePercent);
-
-                LogSessionVolumeResults(controls.Channel.Name, processNames, volumePercent, results);
-
-                if (results.Any(result => result.Status == "Applied"))
-                {
-                    SetEndpointControlsEnabled(controls, enabled: true);
-                    SetStatus(controls, "Found");
-                    SaveSettings();
-                    RefreshAppSessions();
-                    return;
-                }
-            }
-        }
-
-        if (!ShouldApplyAppSessionVolume())
-        {
-            SaveSettings();
-            return;
-        }
-
-        ApplyEndpointVolumeFallback(controls, volumePercent);
+        var gain = volumePercent / 100f;
+        settings.MonitorMix.ChannelGains[controls.Channel.Name] = gain;
+        monitorMixEngine.SetChannelGain(controls.Channel.Name, gain);
+        AppendLog($"{controls.Channel.Name} monitor gain = {volumePercent}%");
+        SaveSettings();
     }
 
     private void ApplyEndpointVolumeFallback(ChannelControls controls, int volumePercent)
@@ -1075,98 +1843,19 @@ public partial class MainForm : Form
 
     private void ToggleChannelMute(ChannelControls controls)
     {
-        if (ShouldApplyAppSessionVolume() && GetProcessNamesForChannel(controls.Channel.Name).Any())
-        {
-            ApplyChannelMute(controls, !controls.Channel.IsMuted);
-            return;
-        }
-
-        var endpointId = controls.Channel.SelectedEndpointId;
-        if (string.IsNullOrWhiteSpace(endpointId))
-        {
-            AppendLog($"{controls.Channel.Name} mute ignored: no endpoint selected.");
-            return;
-        }
-
-        try
-        {
-            var currentMute = audioEndpointController.GetMute(endpointId);
-            ApplyChannelMute(controls, !currentMute);
-        }
-        catch (Exception ex)
-        {
-            SetStatus(controls, "Error");
-            AppendLog($"{controls.Channel.Name} mute read error: {ex.Message}");
-        }
+        var isMuted = !settings.MonitorMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
+        ApplyChannelMute(controls, isMuted);
     }
 
     private void ApplyChannelMute(ChannelControls controls, bool isMuted)
     {
-        if (ShouldApplyMonitorMixGain())
-        {
-            settings.MonitorMix.ChannelMutes[controls.Channel.Name] = isMuted;
-            monitorMixEngine.SetChannelMute(controls.Channel.Name, isMuted);
-            AppendLog($"{controls.Channel.Name} monitor mute = {(isMuted ? "on" : "off")}");
-        }
-
-        if (ShouldApplyAppSessionVolume())
-        {
-            var processNames = GetProcessNamesForChannel(controls.Channel.Name).ToList();
-            if (processNames.Count > 0)
-            {
-                var results = audioSessionController.SetSessionMuteForProcesses(
-                    endpoints,
-                    processNames,
-                    controls.Channel.Name,
-                    isMuted);
-
-                LogSessionMuteResults(controls.Channel.Name, processNames, isMuted, results);
-
-                if (results.Any(result => result.Status == "Applied"))
-                {
-                    controls.Channel.IsMuted = isMuted;
-                    SetMuteUiValue(controls, isMuted);
-                    SetEndpointControlsEnabled(controls, enabled: true);
-                    SetStatus(controls, isMuted ? "Muted" : "Found");
-                    SaveSettings();
-                    RefreshAppSessions();
-                    return;
-                }
-            }
-        }
-
-        if (!ShouldApplyAppSessionVolume())
-        {
-            controls.Channel.IsMuted = isMuted;
-            SetMuteUiValue(controls, isMuted);
-            SetStatus(controls, isMuted ? "Muted" : "Found");
-            SaveSettings();
-            return;
-        }
-
-        var endpointId = controls.Channel.SelectedEndpointId;
-        if (string.IsNullOrWhiteSpace(endpointId))
-        {
-            AppendLog($"{controls.Channel.Name} mute ignored: no active routed app session and no endpoint selected.");
-            return;
-        }
-
-        try
-        {
-            audioEndpointController.SetMute(endpointId, isMuted);
-
-            controls.Channel.IsMuted = isMuted;
-            SetMuteUiValue(controls, isMuted);
-            SetEndpointControlsEnabled(controls, enabled: true);
-            SetStatus(controls, isMuted ? "Muted" : "Found");
-            AppendLog($"{controls.Channel.Name} mute = {(isMuted ? "on" : "off")}");
-            SaveSettings();
-        }
-        catch (Exception ex)
-        {
-            SetStatus(controls, "Error");
-            AppendLog($"{controls.Channel.Name} mute error: {ex.Message}");
-        }
+        settings.MonitorMix.ChannelMutes[controls.Channel.Name] = isMuted;
+        monitorMixEngine.SetChannelMute(controls.Channel.Name, isMuted);
+        controls.Channel.IsMuted = isMuted;
+        SetMuteUiValue(controls, isMuted);
+        SetStatus(controls, isMuted ? "Muted" : "Found");
+        AppendLog($"{controls.Channel.Name} monitor mute = {(isMuted ? "on" : "off")}");
+        SaveSettings();
     }
 
     private static void SetEndpointControlsEnabled(ChannelControls controls, bool enabled)
@@ -1176,7 +1865,7 @@ public partial class MainForm : Form
 
     private void MarkEndpointUnavailable(ChannelControls controls, string status)
     {
-        SetEndpointControlsEnabled(controls, enabled: false);
+        SetEndpointControlsEnabled(controls, enabled: true);
         SetStatus(controls, status);
     }
 
@@ -2103,14 +2792,12 @@ public partial class MainForm : Form
 
     private bool ShouldApplyAppSessionVolume()
     {
-        var mode = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
-        return mode is "Both" or "App Session Volume";
+        return false;
     }
 
     private bool ShouldApplyMonitorMixGain()
     {
-        var mode = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
-        return mode is "Both" or "Monitor Mix Gain";
+        return true;
     }
 
     private static string NormalizeProcessName(string processName)
@@ -2283,7 +2970,7 @@ public partial class MainForm : Form
 
     private void AppendLog(string message)
     {
-        if (logTextBox.IsDisposed)
+        if (logTextBox.IsDisposed || Disposing || IsDisposed)
         {
             return;
         }
@@ -2302,7 +2989,7 @@ public partial class MainForm : Form
 
     private void RunOnUiThread(Action action)
     {
-        if (IsDisposed)
+        if (IsDisposed || Disposing || !IsHandleCreated)
         {
             return;
         }
@@ -2316,6 +3003,9 @@ public partial class MainForm : Form
         try
         {
             BeginInvoke(action);
+        }
+        catch (ObjectDisposedException)
+        {
         }
         catch (InvalidOperationException)
         {
@@ -2337,6 +3027,17 @@ public partial class MainForm : Form
         public Button MuteButton => StripControl.MuteButton;
 
         public Label StatusLabel => StripControl.StatusLabel;
+
+        public bool IsUpdating { get; set; }
+    }
+
+    private sealed class StreamChannelControls(
+        string channelName,
+        ChannelStripControl stripControl)
+    {
+        public string ChannelName { get; } = channelName;
+
+        public ChannelStripControl StripControl { get; } = stripControl;
 
         public bool IsUpdating { get; set; }
     }

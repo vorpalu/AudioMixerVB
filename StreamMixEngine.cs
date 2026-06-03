@@ -4,7 +4,7 @@ using NAudio.Wave.SampleProviders;
 
 namespace AudioMixerVB;
 
-public sealed class MonitorMixEngine : IDisposable
+public sealed class StreamMixEngine : IDisposable
 {
     private const int MixSampleRate = 48000;
     private const int MixChannels = 2;
@@ -13,7 +13,7 @@ public sealed class MonitorMixEngine : IDisposable
     private readonly Dictionary<string, float> channelGains = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, bool> channelMutes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MeterState> channelMeters = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, MonitorChannelSampleProvider> activeProviders = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, StreamChannelSampleProvider> activeProviders = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<CaptureChannel> captureChannels = [];
     private readonly MeterState masterMeter = new();
 
@@ -25,11 +25,11 @@ public sealed class MonitorMixEngine : IDisposable
     private float masterGain = 1f;
     private bool masterMuted;
 
-    public MonitorMixEngine()
+    public StreamMixEngine()
     {
         foreach (var channelName in MixerChannel.DefaultChannelNames)
         {
-            channelGains[channelName] = 0.5f;
+            channelGains[channelName] = 1.0f;
             channelMutes[channelName] = false;
             channelMeters[channelName] = new MeterState();
         }
@@ -62,14 +62,6 @@ public sealed class MonitorMixEngine : IDisposable
         }
     }
 
-    public float GetChannelRms(string channelName)
-    {
-        lock (syncRoot)
-        {
-            return channelMeters.TryGetValue(channelName, out var meter) ? meter.GetRms() : 0f;
-        }
-    }
-
     public float GetMasterPeak()
     {
         lock (syncRoot)
@@ -97,23 +89,20 @@ public sealed class MonitorMixEngine : IDisposable
         }
     }
 
-    public void SetChannelInput(string channelName, string recordingEndpointId)
+    public void SetChannelInput(string channelName, string captureEndpointId)
     {
         lock (syncRoot)
         {
-            if (string.IsNullOrWhiteSpace(recordingEndpointId))
+            if (string.IsNullOrWhiteSpace(captureEndpointId))
             {
                 channelInputEndpointIds.Remove(channelName);
             }
             else
             {
-                channelInputEndpointIds[channelName] = recordingEndpointId;
+                channelInputEndpointIds[channelName] = captureEndpointId;
             }
         }
     }
-
-    public void SetChannelVolume(string channelName, float volume0to1)
-        => SetChannelGain(channelName, volume0to1);
 
     public void SetChannelGain(string channelName, float gain0to1)
     {
@@ -124,6 +113,18 @@ public sealed class MonitorMixEngine : IDisposable
             if (activeProviders.TryGetValue(channelName, out var provider))
             {
                 provider.SetGain(gain);
+            }
+        }
+    }
+
+    public void SetChannelMute(string channelName, bool muted)
+    {
+        lock (syncRoot)
+        {
+            channelMutes[channelName] = muted;
+            if (activeProviders.TryGetValue(channelName, out var provider))
+            {
+                provider.SetMute(muted);
             }
         }
     }
@@ -147,18 +148,6 @@ public sealed class MonitorMixEngine : IDisposable
         }
     }
 
-    public void SetChannelMute(string channelName, bool muted)
-    {
-        lock (syncRoot)
-        {
-            channelMutes[channelName] = muted;
-            if (activeProviders.TryGetValue(channelName, out var provider))
-            {
-                provider.SetMute(muted);
-            }
-        }
-    }
-
     public void Start()
     {
         lock (syncRoot)
@@ -171,21 +160,21 @@ public sealed class MonitorMixEngine : IDisposable
 
             if (isStopping)
             {
-                throw new InvalidOperationException("Monitor engine is stopping.");
+                throw new InvalidOperationException("Stream mix engine is stopping.");
             }
 
             if (string.IsNullOrWhiteSpace(outputEndpointId))
             {
-                throw new InvalidOperationException("Select a monitor output device before starting.");
+                throw new InvalidOperationException("Select a stream output device before starting.");
             }
 
-            OnLog?.Invoke(this, "Starting monitor engine.");
+            OnLog?.Invoke(this, "Starting stream mix engine.");
 
             try
             {
                 StartLocked();
                 IsRunning = true;
-                OnLog?.Invoke(this, "Started monitor engine.");
+                OnLog?.Invoke(this, "Started stream mix engine.");
             }
             catch
             {
@@ -231,7 +220,7 @@ public sealed class MonitorMixEngine : IDisposable
     private void StartLocked()
     {
         var outputDevice = FindDevice(outputEndpointId!, NAudio.CoreAudioApi.DataFlow.Render);
-        OnLog?.Invoke(this, $"Monitor output = {outputDevice.FriendlyName}");
+        OnLog?.Invoke(this, $"Stream output = {outputDevice.FriendlyName}");
 
         var mixer = new MixingSampleProvider(WaveFormat.CreateIeeeFloatWaveFormat(MixSampleRate, MixChannels))
         {
@@ -243,7 +232,7 @@ public sealed class MonitorMixEngine : IDisposable
             if (!channelInputEndpointIds.TryGetValue(channelName, out var endpointId) ||
                 string.IsNullOrWhiteSpace(endpointId))
             {
-                OnLog?.Invoke(this, $"Monitor {channelName} input not selected; skipping capture.");
+                OnLog?.Invoke(this, $"Stream {channelName} input not selected; skipping capture.");
                 continue;
             }
 
@@ -270,7 +259,7 @@ public sealed class MonitorMixEngine : IDisposable
                 catch (Exception ex)
                 {
                     OnError?.Invoke(this, ex);
-                    OnLog?.Invoke(this, $"Capture error for {channelName}: {ex.Message}");
+                    OnLog?.Invoke(this, $"Stream capture error for {channelName}: {ex.Message}");
                 }
             };
             EventHandler<StoppedEventArgs> recordingStoppedHandler = (_, args) =>
@@ -283,7 +272,7 @@ public sealed class MonitorMixEngine : IDisposable
                 if (args.Exception is not null)
                 {
                     OnError?.Invoke(this, args.Exception);
-                    OnLog?.Invoke(this, $"Capture stopped with error for {channelName}: {args.Exception.Message}");
+                    OnLog?.Invoke(this, $"Stream capture stopped with error for {channelName}: {args.Exception.Message}");
                 }
             };
             capture.DataAvailable += dataAvailableHandler;
@@ -296,10 +285,10 @@ public sealed class MonitorMixEngine : IDisposable
                 sampleProvider = new WdlResamplingSampleProvider(sampleProvider, MixSampleRate);
             }
 
-            var gainProvider = new MonitorChannelSampleProvider(
+            var gainProvider = new StreamChannelSampleProvider(
                 channelName,
                 sampleProvider,
-                channelGains.GetValueOrDefault(channelName, 0.5f),
+                channelGains.GetValueOrDefault(channelName, 1.0f),
                 channelMutes.GetValueOrDefault(channelName),
                 message => OnLog?.Invoke(this, message),
                 (peak, rms) => UpdateChannelMeter(channelName, peak, rms));
@@ -312,12 +301,12 @@ public sealed class MonitorMixEngine : IDisposable
                 bufferedProvider,
                 dataAvailableHandler,
                 recordingStoppedHandler));
-            OnLog?.Invoke(this, $"Started capture for {channelName}: {captureDevice.FriendlyName}");
+            OnLog?.Invoke(this, $"Started stream capture for {channelName}: {captureDevice.FriendlyName}");
         }
 
         if (captureChannels.Count == 0)
         {
-            throw new InvalidOperationException("Select at least one monitor input before starting.");
+            throw new InvalidOperationException("Select at least one stream input before starting.");
         }
 
         masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, UpdateMasterMeter);
@@ -330,7 +319,7 @@ public sealed class MonitorMixEngine : IDisposable
         }
 
         output.Play();
-        OnLog?.Invoke(this, "Started monitor output.");
+        OnLog?.Invoke(this, "Started stream output.");
     }
 
     private void StopCore()
@@ -338,13 +327,13 @@ public sealed class MonitorMixEngine : IDisposable
         List<CaptureChannel> capturesToStop;
         WasapiOut? outputToStop;
 
-        OnLog?.Invoke(this, "Monitor Stop requested.");
+        OnLog?.Invoke(this, "Stream Stop requested.");
 
         lock (syncRoot)
         {
             if (isStopping)
             {
-                OnLog?.Invoke(this, "Monitor stop ignored; stop already in progress.");
+                OnLog?.Invoke(this, "Stream stop ignored; stop already in progress.");
                 return;
             }
 
@@ -363,7 +352,7 @@ public sealed class MonitorMixEngine : IDisposable
             IsRunning = false;
         }
 
-        OnLog?.Invoke(this, "Monitor stopping captures...");
+        OnLog?.Invoke(this, "Stream stopping captures...");
 
         foreach (var channel in capturesToStop)
         {
@@ -376,22 +365,22 @@ public sealed class MonitorMixEngine : IDisposable
             catch (Exception ex)
             {
                 OnError?.Invoke(this, ex);
-                OnLog?.Invoke(this, $"Monitor stop error: {ex.Message}");
+                OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
             }
 
             try
             {
                 channel.Dispose();
-                OnLog?.Invoke(this, $"Monitor capture disposed: {channel.ChannelName}");
+                OnLog?.Invoke(this, $"Stream capture disposed: {channel.ChannelName}");
             }
             catch (Exception ex)
             {
                 OnError?.Invoke(this, ex);
-                OnLog?.Invoke(this, $"Monitor stop error: {ex.Message}");
+                OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
             }
         }
 
-        OnLog?.Invoke(this, "Monitor stopping output...");
+        OnLog?.Invoke(this, "Stream stopping output...");
 
         try
         {
@@ -400,7 +389,7 @@ public sealed class MonitorMixEngine : IDisposable
         catch (Exception ex)
         {
             OnError?.Invoke(this, ex);
-            OnLog?.Invoke(this, $"Monitor stop error: {ex.Message}");
+            OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
         }
 
         try
@@ -408,13 +397,13 @@ public sealed class MonitorMixEngine : IDisposable
             outputToStop?.Dispose();
             if (outputToStop is not null)
             {
-                OnLog?.Invoke(this, "Monitor output disposed.");
+                OnLog?.Invoke(this, "Stream output disposed.");
             }
         }
         catch (Exception ex)
         {
             OnError?.Invoke(this, ex);
-            OnLog?.Invoke(this, $"Monitor stop error: {ex.Message}");
+            OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
         }
 
         lock (syncRoot)
@@ -423,7 +412,7 @@ public sealed class MonitorMixEngine : IDisposable
             isStopping = false;
         }
 
-        OnLog?.Invoke(this, "Monitor stopped.");
+        OnLog?.Invoke(this, "Stream stopped.");
     }
 
     private static MMDevice FindDevice(string endpointId, NAudio.CoreAudioApi.DataFlow dataFlow)
@@ -446,7 +435,7 @@ public sealed class MonitorMixEngine : IDisposable
     {
         if (disposed)
         {
-            throw new ObjectDisposedException(nameof(MonitorMixEngine));
+            throw new ObjectDisposedException(nameof(StreamMixEngine));
         }
     }
 
@@ -533,15 +522,6 @@ public sealed class MonitorMixEngine : IDisposable
             }
         }
 
-        public float GetRms()
-        {
-            lock (syncRoot)
-            {
-                DecayToNow();
-                return smoothedRms;
-            }
-        }
-
         public void Reset()
         {
             lock (syncRoot)
@@ -568,7 +548,7 @@ public sealed class MonitorMixEngine : IDisposable
         }
     }
 
-    private sealed class MonitorChannelSampleProvider : ISampleProvider
+    private sealed class StreamChannelSampleProvider : ISampleProvider
     {
         private readonly string channelName;
         private readonly ISampleProvider source;
@@ -579,7 +559,7 @@ public sealed class MonitorMixEngine : IDisposable
         private float gain;
         private bool muted;
 
-        public MonitorChannelSampleProvider(
+        public StreamChannelSampleProvider(
             string channelName,
             ISampleProvider source,
             float gain,
@@ -673,7 +653,7 @@ public sealed class MonitorMixEngine : IDisposable
             }
 
             lastUnderrunLogTicks = now;
-            log($"Buffer underrun on {channelName}; using silence.");
+            log($"Stream buffer underrun on {channelName}; using silence.");
         }
     }
 
