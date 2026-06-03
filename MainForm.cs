@@ -1,0 +1,2357 @@
+using System.Diagnostics;
+using System.Globalization;
+
+namespace AudioMixerVB;
+
+public partial class MainForm : Form
+{
+    private readonly AudioEndpointController audioEndpointController = new();
+    private readonly AudioSessionController audioSessionController = new();
+    private readonly MonitorMixEngine monitorMixEngine = new();
+    private readonly UndocumentedAudioPolicyRouter audioPolicyRouter = new();
+    private readonly SettingsService settingsService = new();
+    private readonly SerialController serialController = new();
+    private readonly Dictionary<string, ChannelControls> channelControlsByName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> lastAutoRoutingMessages = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<MixerChannel> channels;
+
+    private AppSettings settings;
+    private IReadOnlyList<AudioEndpoint> endpoints = [];
+    private IReadOnlyList<AudioEndpoint> captureEndpoints = [];
+    private IReadOnlyList<AudioAppSession> appSessions = [];
+    private IReadOnlyList<AudioAppGroup> appGroups = [];
+    private bool updatingAppRoutingUi;
+    private bool updatingMonitorUi;
+    private bool updatingSerialUi;
+
+    private GroupBox monitorMixGroupBox = null!;
+    private TableLayoutPanel monitorMixLayout = null!;
+    private ComboBox monitorOutputComboBox = null!;
+    private ComboBox monitorGameInputComboBox = null!;
+    private ComboBox monitorChatInputComboBox = null!;
+    private ComboBox monitorMusicInputComboBox = null!;
+    private ComboBox monitorMediaInputComboBox = null!;
+    private ComboBox channelSliderModeComboBox = null!;
+    private Button startMonitorButton = null!;
+    private Button stopMonitorButton = null!;
+    private Button restartMonitorButton = null!;
+    private Label monitorStatusValueLabel = null!;
+    private Label monitorLatencyValueLabel = null!;
+    private Label monitorWarningLabel = null!;
+    private ChannelStripControl masterStripControl = null!;
+    private Button clearLogButton = null!;
+    private Button copyLogButton = null!;
+    private CheckBox autoScrollLogCheckBox = null!;
+
+    public MainForm()
+    {
+        InitializeComponent();
+        audioEndpointController.LogMessage += (_, message) => AppendLog(message);
+        audioSessionController.LogMessage += (_, message) => AppendLog(message);
+        monitorMixEngine.OnLog += (_, message) => RunOnUiThread(() => AppendLog(message));
+        monitorMixEngine.OnError += (_, ex) => RunOnUiThread(() => AppendLog($"Monitor error: {ex.Message}"));
+
+        settings = settingsService.Load(out var settingsFileLoaded, out var settingsError);
+        channels = settings.Channels;
+
+        BuildMonitorMixPanel();
+        SetupAppSessionsGrid();
+        LoadRoutingOptions();
+        BuildChannelPanels();
+        BuildLogTools();
+        ApplyDarkTheme();
+        WireEvents();
+        LoadSerialSettings();
+        RefreshComPorts();
+        RefreshEndpoints(applyFirstRunAutoMapping: !settingsFileLoaded);
+        RefreshAppSessions();
+        if (settings.MonitorMix.EnabledOnStartup)
+        {
+            StartMonitor();
+        }
+
+        AppendLog($"Settings path: {settingsService.SettingsPath}");
+        if (settingsFileLoaded)
+        {
+            AppendLog("Settings loaded.");
+        }
+        else
+        {
+            AppendLog("No settings file found; using defaults.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(settingsError))
+        {
+            AppendLog($"Settings load error: {settingsError}");
+        }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        monitorMixEngine.Dispose();
+        serialController.Dispose();
+        base.OnFormClosed(e);
+    }
+
+    private void WireEvents()
+    {
+        refreshEndpointsButton.Click += (_, _) => RefreshEndpoints(applyFirstRunAutoMapping: false);
+        monitorOutputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorOutputChanged();
+        monitorGameInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Game", monitorGameInputComboBox);
+        monitorChatInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Chat", monitorChatInputComboBox);
+        monitorMusicInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Music", monitorMusicInputComboBox);
+        monitorMediaInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Media", monitorMediaInputComboBox);
+        channelSliderModeComboBox.SelectedIndexChanged += (_, _) => HandleChannelSliderModeChanged();
+        startMonitorButton.Click += (_, _) => StartMonitor();
+        stopMonitorButton.Click += (_, _) => StopMonitor();
+        restartMonitorButton.Click += (_, _) => RestartMonitor();
+        refreshAppsButton.Click += (_, _) => RefreshAppSessions();
+        applyRoutingButton.Click += (_, _) => ApplyRouting(autoTriggered: false);
+        saveRoutingRulesButton.Click += (_, _) => SaveRoutingRulesFromGrid(persist: true);
+        clearRoutingButton.Click += (_, _) => ClearRoutingRules();
+        openWindowsVolumeMixerButton.Click += (_, _) => OpenWindowsVolumeMixer();
+        enableExperimentalRoutingCheckBox.CheckedChanged += (_, _) =>
+        {
+            settings.EnableExperimentalAutomaticRouting = enableExperimentalRoutingCheckBox.Checked;
+            SaveSettings();
+        };
+        autoApplyRoutingRulesCheckBox.CheckedChanged += (_, _) =>
+        {
+            settings.AutoApplyRoutingRules = autoApplyRoutingRulesCheckBox.Checked;
+            autoApplyRoutingTimer.Enabled = settings.AutoApplyRoutingRules;
+            SaveSettings();
+        };
+        autoApplyRoutingTimer.Tick += (_, _) => ApplyRouting(autoTriggered: true);
+        meterUpdateTimer.Tick += (_, _) => UpdateMeters();
+        meterUpdateTimer.Start();
+        showRawSessionsCheckBox.CheckedChanged += (_, _) => BindAppSessionsGrid();
+        appSessionsGrid.CurrentCellDirtyStateChanged += (_, _) =>
+        {
+            if (appSessionsGrid.IsCurrentCellDirty)
+            {
+                appSessionsGrid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            }
+        };
+        appSessionsGrid.CellValueChanged += (_, args) =>
+        {
+            if (updatingAppRoutingUi)
+            {
+                return;
+            }
+
+            if (args.RowIndex >= 0 && appSessionsGrid.Columns[args.ColumnIndex].Name == "AssignedChannel")
+            {
+                SaveRoutingRulesFromGrid(persist: false);
+                AssignChannelsToSessions();
+                appGroups = BuildAppGroups();
+                BindAppSessionsGrid();
+                UpdateChannelControlAvailability();
+            }
+        };
+        appSessionsGrid.DataError += (_, args) =>
+        {
+            args.ThrowException = false;
+            AppendLog($"Application routing grid error: {args.Exception?.Message}");
+        };
+        refreshComButton.Click += (_, _) => RefreshComPorts();
+        connectSerialButton.Click += (_, _) => ToggleSerialConnection();
+        serialPortComboBox.SelectedIndexChanged += (_, _) => SaveSerialSelection();
+        baudRateTextBox.TextChanged += (_, _) => SaveBaudRateIfValid();
+        clearLogButton.Click += (_, _) => logTextBox.Clear();
+        copyLogButton.Click += (_, _) =>
+        {
+            if (!string.IsNullOrEmpty(logTextBox.Text))
+            {
+                Clipboard.SetText(logTextBox.Text);
+            }
+        };
+        serialController.OnCommandReceived += (_, args) => RunOnUiThread(() => HandleSerialCommand(args));
+        serialController.OnLogMessage += (_, message) => RunOnUiThread(() => AppendLog(message));
+    }
+
+    private void BuildMonitorMixPanel()
+    {
+        monitorTabPage.SuspendLayout();
+
+        monitorMixGroupBox = new GroupBox
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(3),
+            Padding = new Padding(10),
+            Text = "Monitor Mix"
+        };
+
+        monitorMixLayout = new TableLayoutPanel
+        {
+            ColumnCount = 4,
+            Dock = DockStyle.Fill,
+            RowCount = 8
+        };
+        monitorMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82F));
+        monitorMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        monitorMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82F));
+        monitorMixLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        for (var row = 0; row < 6; row++)
+        {
+            monitorMixLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+        }
+        monitorMixLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        monitorMixLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        monitorOutputComboBox = CreateMonitorComboBox();
+        monitorGameInputComboBox = CreateMonitorComboBox();
+        monitorChatInputComboBox = CreateMonitorComboBox();
+        monitorMusicInputComboBox = CreateMonitorComboBox();
+        monitorMediaInputComboBox = CreateMonitorComboBox();
+        channelSliderModeComboBox = CreateMonitorComboBox();
+        channelSliderModeComboBox.Items.AddRange(["Both", "App Session Volume", "Monitor Mix Gain"]);
+
+        startMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Start Monitor", UseVisualStyleBackColor = true };
+        stopMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Stop", UseVisualStyleBackColor = true };
+        restartMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Restart", UseVisualStyleBackColor = true };
+        monitorStatusValueLabel = new Label { Dock = DockStyle.Fill, Text = "Stopped", TextAlign = ContentAlignment.MiddleLeft };
+        monitorLatencyValueLabel = new Label { Dock = DockStyle.Fill, Text = $"{settings.MonitorMix.LatencyMs} ms", TextAlign = ContentAlignment.MiddleLeft };
+        monitorWarningLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            ForeColor = Color.DarkOrange,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        AddMonitorRow(0, "Output", monitorOutputComboBox, "Mode", channelSliderModeComboBox);
+        AddMonitorRow(1, "Game", monitorGameInputComboBox, "Chat", monitorChatInputComboBox);
+        AddMonitorRow(2, "Music", monitorMusicInputComboBox, "Media", monitorMediaInputComboBox);
+        AddMonitorRow(3, "Status", monitorStatusValueLabel, "Latency", monitorLatencyValueLabel);
+
+        monitorMixLayout.Controls.Add(startMonitorButton, 0, 6);
+        monitorMixLayout.SetColumnSpan(startMonitorButton, 2);
+        monitorMixLayout.Controls.Add(stopMonitorButton, 2, 6);
+        monitorMixLayout.Controls.Add(restartMonitorButton, 3, 6);
+        monitorMixLayout.Controls.Add(monitorWarningLabel, 0, 7);
+        monitorMixLayout.SetColumnSpan(monitorWarningLabel, 4);
+
+        monitorMixGroupBox.Controls.Add(monitorMixLayout);
+        monitorTabPage.Controls.Add(monitorMixGroupBox);
+        monitorTabPage.ResumeLayout();
+    }
+
+    private static ComboBox CreateMonitorComboBox()
+    {
+        return new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            FormattingEnabled = true
+        };
+    }
+
+    private void AddMonitorRow(
+        int row,
+        string leftLabel,
+        Control leftControl,
+        string rightLabel,
+        Control rightControl)
+    {
+        monitorMixLayout.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = leftLabel,
+            TextAlign = ContentAlignment.MiddleLeft
+        }, 0, row);
+        monitorMixLayout.Controls.Add(leftControl, 1, row);
+        monitorMixLayout.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = rightLabel,
+            TextAlign = ContentAlignment.MiddleLeft
+        }, 2, row);
+        monitorMixLayout.Controls.Add(rightControl, 3, row);
+    }
+
+    private void ApplyDarkTheme()
+    {
+        ApplyDarkTheme(this);
+
+        appSessionsGrid.BackgroundColor = Color.FromArgb(24, 26, 31);
+        appSessionsGrid.GridColor = Color.FromArgb(55, 60, 70);
+        appSessionsGrid.EnableHeadersVisualStyles = false;
+        appSessionsGrid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(38, 42, 50);
+        appSessionsGrid.ColumnHeadersDefaultCellStyle.ForeColor = Color.WhiteSmoke;
+        appSessionsGrid.DefaultCellStyle.BackColor = Color.FromArgb(28, 31, 36);
+        appSessionsGrid.DefaultCellStyle.ForeColor = Color.Gainsboro;
+        appSessionsGrid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(58, 89, 130);
+        appSessionsGrid.DefaultCellStyle.SelectionForeColor = Color.White;
+        appSessionsGrid.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(32, 36, 42);
+        appSessionsGrid.RowHeadersDefaultCellStyle.BackColor = Color.FromArgb(38, 42, 50);
+        appSessionsGrid.RowHeadersDefaultCellStyle.ForeColor = Color.WhiteSmoke;
+    }
+
+    private void BuildLogTools()
+    {
+        var existingLogTextBox = logTextBox;
+        logGroupBox.Controls.Clear();
+
+        var logLayout = new TableLayoutPanel
+        {
+            ColumnCount = 1,
+            Dock = DockStyle.Fill,
+            RowCount = 2
+        };
+        logLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        logLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+        logLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        var toolbar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false
+        };
+
+        clearLogButton = new Button
+        {
+            AutoSize = true,
+            Text = "Clear log",
+            UseVisualStyleBackColor = true
+        };
+        copyLogButton = new Button
+        {
+            AutoSize = true,
+            Text = "Copy log",
+            UseVisualStyleBackColor = true
+        };
+        autoScrollLogCheckBox = new CheckBox
+        {
+            AutoSize = true,
+            Checked = true,
+            Text = "Auto-scroll",
+            UseVisualStyleBackColor = true
+        };
+
+        toolbar.Controls.Add(clearLogButton);
+        toolbar.Controls.Add(copyLogButton);
+        toolbar.Controls.Add(autoScrollLogCheckBox);
+        logLayout.Controls.Add(toolbar, 0, 0);
+        logLayout.Controls.Add(existingLogTextBox, 0, 1);
+        logGroupBox.Controls.Add(logLayout);
+    }
+
+    private static void ApplyDarkTheme(Control control)
+    {
+        if (control is ChannelStripControl)
+        {
+            return;
+        }
+
+        switch (control)
+        {
+            case Form:
+            case TabPage:
+            case TableLayoutPanel:
+            case FlowLayoutPanel:
+            case Panel:
+                control.BackColor = Color.FromArgb(24, 26, 31);
+                control.ForeColor = Color.Gainsboro;
+                break;
+            case GroupBox:
+                control.BackColor = Color.FromArgb(28, 31, 36);
+                control.ForeColor = Color.WhiteSmoke;
+                break;
+            case Label:
+                control.BackColor = Color.Transparent;
+                control.ForeColor = Color.Gainsboro;
+                break;
+            case Button button:
+                button.UseVisualStyleBackColor = false;
+                button.BackColor = Color.FromArgb(48, 52, 60);
+                button.ForeColor = Color.WhiteSmoke;
+                button.FlatStyle = FlatStyle.Flat;
+                break;
+            case TextBox textBox:
+                textBox.BackColor = Color.FromArgb(19, 21, 25);
+                textBox.ForeColor = Color.Gainsboro;
+                break;
+            case ComboBox comboBox:
+                comboBox.BackColor = Color.FromArgb(38, 42, 50);
+                comboBox.ForeColor = Color.WhiteSmoke;
+                break;
+            case CheckBox checkBox:
+                checkBox.BackColor = Color.Transparent;
+                checkBox.ForeColor = Color.Gainsboro;
+                break;
+        }
+
+        foreach (Control child in control.Controls)
+        {
+            ApplyDarkTheme(child);
+        }
+    }
+
+    private void BuildChannelPanels()
+    {
+        channelsTable.SuspendLayout();
+        channelsTable.Controls.Clear();
+        channelsTable.ColumnStyles.Clear();
+        channelsTable.RowStyles.Clear();
+        channelsTable.ColumnCount = channels.Count + 1;
+        channelsTable.RowCount = 1;
+        channelsTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        for (var column = 0; column < channelsTable.ColumnCount; column++)
+        {
+            channelsTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F / channelsTable.ColumnCount));
+        }
+
+        masterStripControl = new ChannelStripControl
+        {
+            ChannelName = "Master",
+            AccentColor = Color.FromArgb(86, 169, 255),
+            EndpointComboBoxVisible = false,
+            VolumePercent = 100,
+            IsMuted = false
+        };
+        masterStripControl.SetEndpointControlsEnabled(enabled: false);
+        masterStripControl.SetStatus("No output", Color.FromArgb(190, 196, 205));
+        channelsTable.Controls.Add(masterStripControl, 0, 0);
+
+        for (var index = 0; index < channels.Count; index++)
+        {
+            var channel = channels[index];
+            var controls = CreateChannelControls(channel);
+            channelControlsByName[channel.Name] = controls;
+
+            controls.StripControl.AccentColor = GetChannelAccentColor(channel.Name);
+            channelsTable.Controls.Add(controls.StripControl, index + 1, 0);
+        }
+
+        UpdateMasterStripSummary();
+        channelsTable.ResumeLayout();
+    }
+
+    private ChannelControls CreateChannelControls(MixerChannel channel)
+    {
+        var stripControl = new ChannelStripControl
+        {
+            ChannelName = channel.Name,
+            VolumePercent = Math.Clamp(channel.VolumePercent, 0, 100),
+            IsMuted = channel.IsMuted
+        };
+
+        var controls = new ChannelControls(channel, stripControl);
+
+        stripControl.EndpointComboBox.SelectedIndexChanged += (_, _) => HandleEndpointSelectionChanged(controls);
+        stripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleVolumeChanged(controls);
+        stripControl.MuteButton.Click += (_, _) => ToggleChannelMute(controls);
+
+        return controls;
+    }
+
+    private static Color GetChannelAccentColor(string channelName)
+    {
+        return channelName.ToUpperInvariant() switch
+        {
+            "GAME" => Color.FromArgb(84, 220, 160),
+            "CHAT" => Color.FromArgb(80, 145, 255),
+            "MEDIA" => Color.FromArgb(232, 88, 180),
+            "MUSIC" => Color.FromArgb(178, 118, 255),
+            _ => Color.DeepSkyBlue
+        };
+    }
+
+    private void UpdateMasterStripSummary()
+    {
+        if (masterStripControl is null)
+        {
+            return;
+        }
+
+        var output = FindMonitorOutputEndpoint();
+        masterStripControl.SetStatus(
+            output?.FriendlyName ?? "No output",
+            output is null ? Color.FromArgb(190, 196, 205) : Color.FromArgb(130, 210, 255));
+    }
+
+    private void UpdateMeters()
+    {
+        if (masterStripControl is not null)
+        {
+            masterStripControl.VuMeter.Value = PeakToPercent(monitorMixEngine.GetMasterPeak());
+        }
+
+        var peaks = monitorMixEngine.GetChannelPeaks();
+        foreach (var controls in channelControlsByName.Values)
+        {
+            controls.StripControl.VuMeter.Value = peaks.TryGetValue(controls.Channel.Name, out var peak)
+                ? PeakToPercent(peak)
+                : 0;
+        }
+    }
+
+    private static int PeakToPercent(float peak)
+        => Math.Clamp((int)Math.Round(Math.Clamp(peak, 0f, 1f) * 100f, MidpointRounding.AwayFromZero), 0, 100);
+
+    private void RefreshEndpoints(bool applyFirstRunAutoMapping)
+    {
+        try
+        {
+            endpoints = audioEndpointController.GetRenderEndpoints();
+            captureEndpoints = audioEndpointController.GetCaptureEndpoints();
+            AppendLog($"Found {endpoints.Count} active render endpoint(s).");
+
+            foreach (var endpoint in endpoints)
+            {
+                AppendLog($"Endpoint: {endpoint.FriendlyName} [{endpoint.Id}]");
+            }
+
+            AppendLog($"Found {captureEndpoints.Count} active capture endpoint(s).");
+            foreach (var endpoint in captureEndpoints)
+            {
+                AppendLog($"Found capture endpoint: {endpoint.FriendlyName} [{endpoint.Id}]");
+            }
+
+            if (applyFirstRunAutoMapping)
+            {
+                ApplyFirstRunAutoMapping();
+                ApplyFirstRunMonitorMapping();
+            }
+
+            RefreshEndpointComboBoxes();
+            RefreshMonitorDeviceComboBoxes();
+            UpdateChannelControlAvailability();
+            SaveSettings();
+        }
+        catch (Exception ex)
+        {
+            endpoints = [];
+            captureEndpoints = [];
+            AppendLog($"Endpoint refresh error: {ex.Message}");
+
+            foreach (var controls in channelControlsByName.Values)
+            {
+                MarkEndpointUnavailable(controls, "Error");
+            }
+        }
+    }
+
+    private void ApplyFirstRunMonitorMapping()
+    {
+        foreach (var channelName in MixerChannel.DefaultChannelNames)
+        {
+            if (!string.IsNullOrWhiteSpace(settings.MonitorMix.GetCaptureEndpointId(channelName)))
+            {
+                continue;
+            }
+
+            var match = FindDefaultCaptureEndpointForChannel(channelName);
+            if (match is null)
+            {
+                continue;
+            }
+
+            settings.MonitorMix.SetCaptureEndpoint(channelName, match);
+            AppendLog($"Auto-mapped monitor {channelName} input to {match.FriendlyName}.");
+        }
+    }
+
+    private AudioEndpoint? FindDefaultCaptureEndpointForChannel(string channelName)
+    {
+        var keywords = channelName.ToUpperInvariant() switch
+        {
+            "GAME" => new[] { "CABLE-A", "VB-Audio Cable A", "Cable A" },
+            "CHAT" => new[] { "CABLE-B", "VB-Audio Cable B", "Cable B" },
+            "MEDIA" => new[] { "CABLE-D", "VB-Audio Cable D", "Cable D" },
+            "MUSIC" => new[] { "CABLE-C", "VB-Audio Cable C", "Cable C" },
+            _ => []
+        };
+
+        return captureEndpoints.FirstOrDefault(endpoint =>
+            keywords.Any(keyword => endpoint.FriendlyName.Contains(keyword, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private void ApplyFirstRunAutoMapping()
+    {
+        var usedEndpointIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var channel in channels)
+        {
+            var match = FindDefaultEndpointForChannel(channel.Name, usedEndpointIds);
+            if (match is null)
+            {
+                continue;
+            }
+
+            channel.SelectedEndpointId = match.Id;
+            channel.SelectedEndpointName = match.FriendlyName;
+            usedEndpointIds.Add(match.Id);
+            AppendLog($"Auto-mapped {channel.Name} to {match.FriendlyName}.");
+        }
+    }
+
+    private AudioEndpoint? FindDefaultEndpointForChannel(string channelName, ISet<string> usedEndpointIds)
+    {
+        var keywords = channelName.ToUpperInvariant() switch
+        {
+            "GAME" => new[] { "CABLE-A", "VB-Audio Cable A", "Cable A" },
+            "CHAT" => new[] { "CABLE-B", "VB-Audio Cable B", "Cable B" },
+            "MEDIA" => new[] { "CABLE-D", "VB-Audio Cable D", "Cable D" },
+            "MUSIC" => new[] { "CABLE-C", "VB-Audio Cable C", "Cable C" },
+            _ => []
+        };
+
+        return endpoints.FirstOrDefault(endpoint =>
+            !usedEndpointIds.Contains(endpoint.Id) &&
+            keywords.Any(keyword => endpoint.FriendlyName.Contains(keyword, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private void RefreshEndpointComboBoxes()
+    {
+        foreach (var controls in channelControlsByName.Values)
+        {
+            controls.IsUpdating = true;
+            controls.EndpointComboBox.BeginUpdate();
+            controls.EndpointComboBox.Items.Clear();
+            controls.EndpointComboBox.Items.Add(EndpointChoice.Empty);
+
+            foreach (var endpoint in endpoints)
+            {
+                controls.EndpointComboBox.Items.Add(new EndpointChoice(endpoint));
+            }
+
+            var selectedEndpoint = FindSelectedEndpoint(controls.Channel);
+            controls.EndpointComboBox.SelectedItem = selectedEndpoint is null
+                ? EndpointChoice.Empty
+                : FindChoice(controls.EndpointComboBox, selectedEndpoint.Id);
+
+            controls.EndpointComboBox.EndUpdate();
+            controls.IsUpdating = false;
+
+            if (selectedEndpoint is null)
+            {
+                MarkEndpointUnavailable(controls, "Not found");
+                continue;
+            }
+
+            controls.Channel.SelectedEndpointId = selectedEndpoint.Id;
+            controls.Channel.SelectedEndpointName = selectedEndpoint.FriendlyName;
+            SyncChannelFromEndpoint(controls, logErrors: true);
+        }
+    }
+
+    private void RefreshMonitorDeviceComboBoxes()
+    {
+        updatingMonitorUi = true;
+        PopulateMonitorOutputComboBox();
+        PopulateMonitorInputComboBox(monitorGameInputComboBox, "Game");
+        PopulateMonitorInputComboBox(monitorChatInputComboBox, "Chat");
+        PopulateMonitorInputComboBox(monitorMusicInputComboBox, "Music");
+        PopulateMonitorInputComboBox(monitorMediaInputComboBox, "Media");
+
+        channelSliderModeComboBox.SelectedItem = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
+        monitorLatencyValueLabel.Text = $"{settings.MonitorMix.LatencyMs} ms";
+        updatingMonitorUi = false;
+
+        ApplyMonitorSettingsToEngine();
+        UpdateMonitorWarning();
+        UpdateMasterStripSummary();
+    }
+
+    private void PopulateMonitorOutputComboBox()
+    {
+        monitorOutputComboBox.BeginUpdate();
+        monitorOutputComboBox.Items.Clear();
+        monitorOutputComboBox.Items.Add(EndpointChoice.Empty);
+
+        foreach (var endpoint in endpoints.Where(endpoint => !IsVbCableEndpoint(endpoint)))
+        {
+            monitorOutputComboBox.Items.Add(new EndpointChoice(endpoint));
+        }
+
+        var selectedEndpoint = FindMonitorOutputEndpoint();
+        if (selectedEndpoint is not null && !monitorOutputComboBox.Items.OfType<EndpointChoice>().Any(choice =>
+                choice.Endpoint?.Id.Equals(selectedEndpoint.Id, StringComparison.OrdinalIgnoreCase) == true))
+        {
+            monitorOutputComboBox.Items.Add(new EndpointChoice(selectedEndpoint));
+        }
+
+        monitorOutputComboBox.SelectedItem = selectedEndpoint is null
+            ? EndpointChoice.Empty
+            : FindChoice(monitorOutputComboBox, selectedEndpoint.Id);
+        monitorOutputComboBox.EndUpdate();
+    }
+
+    private void PopulateMonitorInputComboBox(ComboBox comboBox, string channelName)
+    {
+        comboBox.BeginUpdate();
+        comboBox.Items.Clear();
+        comboBox.Items.Add(EndpointChoice.Empty);
+
+        foreach (var endpoint in captureEndpoints)
+        {
+            comboBox.Items.Add(new EndpointChoice(endpoint));
+        }
+
+        var selectedEndpoint = FindMonitorCaptureEndpoint(channelName);
+        comboBox.SelectedItem = selectedEndpoint is null
+            ? EndpointChoice.Empty
+            : FindChoice(comboBox, selectedEndpoint.Id);
+        comboBox.EndUpdate();
+    }
+
+    private AudioEndpoint? FindMonitorOutputEndpoint()
+    {
+        if (!string.IsNullOrWhiteSpace(settings.MonitorMix.OutputEndpointId))
+        {
+            var byId = endpoints.FirstOrDefault(endpoint =>
+                endpoint.Id.Equals(settings.MonitorMix.OutputEndpointId, StringComparison.OrdinalIgnoreCase));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.MonitorMix.OutputEndpointFriendlyName))
+        {
+            return endpoints.FirstOrDefault(endpoint =>
+                endpoint.FriendlyName.Equals(settings.MonitorMix.OutputEndpointFriendlyName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return null;
+    }
+
+    private AudioEndpoint? FindMonitorCaptureEndpoint(string channelName)
+    {
+        var endpointId = settings.MonitorMix.GetCaptureEndpointId(channelName);
+        if (!string.IsNullOrWhiteSpace(endpointId))
+        {
+            var byId = captureEndpoints.FirstOrDefault(endpoint =>
+                endpoint.Id.Equals(endpointId, StringComparison.OrdinalIgnoreCase));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        var friendlyName = settings.MonitorMix.GetCaptureEndpointFriendlyName(channelName);
+        if (!string.IsNullOrWhiteSpace(friendlyName))
+        {
+            return captureEndpoints.FirstOrDefault(endpoint =>
+                endpoint.FriendlyName.Equals(friendlyName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return null;
+    }
+
+    private void HandleMonitorOutputChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        var endpoint = (monitorOutputComboBox.SelectedItem as EndpointChoice)?.Endpoint;
+        settings.MonitorMix.OutputEndpointId = endpoint?.Id;
+        settings.MonitorMix.OutputEndpointFriendlyName = endpoint?.FriendlyName;
+        ApplyMonitorSettingsToEngine();
+        UpdateMonitorWarning();
+        UpdateMasterStripSummary();
+        SaveSettings();
+
+        if (endpoint is not null)
+        {
+            AppendLog($"Monitor output = {endpoint.FriendlyName}");
+        }
+    }
+
+    private void HandleMonitorInputChanged(string channelName, ComboBox comboBox)
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        var endpoint = (comboBox.SelectedItem as EndpointChoice)?.Endpoint;
+        settings.MonitorMix.SetCaptureEndpoint(channelName, endpoint);
+        ApplyMonitorSettingsToEngine();
+        SaveSettings();
+
+        if (endpoint is not null)
+        {
+            AppendLog($"Monitor {channelName} input = {endpoint.FriendlyName}");
+        }
+    }
+
+    private void HandleChannelSliderModeChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        settings.MonitorMix.ChannelSliderMode = channelSliderModeComboBox.SelectedItem?.ToString() ?? "Monitor Mix Gain";
+        SaveSettings();
+        AppendLog($"Channel slider mode = {settings.MonitorMix.ChannelSliderMode}");
+    }
+
+    private void ApplyMonitorSettingsToEngine()
+    {
+        monitorMixEngine.LatencyMs = settings.MonitorMix.LatencyMs;
+
+        monitorMixEngine.SetOutputDevice(settings.MonitorMix.OutputEndpointId ?? string.Empty);
+
+        foreach (var channelName in MixerChannel.DefaultChannelNames)
+        {
+            var endpointId = settings.MonitorMix.GetCaptureEndpointId(channelName);
+            monitorMixEngine.SetChannelInput(channelName, endpointId ?? string.Empty);
+
+            monitorMixEngine.SetChannelVolume(
+                channelName,
+                settings.MonitorMix.ChannelGains.GetValueOrDefault(channelName, 0.5f));
+            monitorMixEngine.SetChannelMute(
+                channelName,
+                settings.MonitorMix.ChannelMutes.GetValueOrDefault(channelName));
+        }
+    }
+
+    private void StartMonitor()
+    {
+        try
+        {
+            ValidateMonitorSelection();
+            ApplyMonitorSettingsToEngine();
+            monitorMixEngine.Start();
+            monitorStatusValueLabel.Text = "Running";
+            monitorStatusValueLabel.ForeColor = Color.ForestGreen;
+            SaveSettings();
+        }
+        catch (Exception ex)
+        {
+            monitorStatusValueLabel.Text = "Error";
+            monitorStatusValueLabel.ForeColor = Color.Firebrick;
+            AppendLog($"Monitor start error: {ex.Message}");
+        }
+    }
+
+    private void StopMonitor()
+    {
+        monitorMixEngine.Stop();
+        monitorStatusValueLabel.Text = "Stopped";
+        monitorStatusValueLabel.ForeColor = Color.DimGray;
+    }
+
+    private void RestartMonitor()
+    {
+        try
+        {
+            ValidateMonitorSelection();
+            ApplyMonitorSettingsToEngine();
+            monitorMixEngine.Restart();
+            monitorStatusValueLabel.Text = "Running";
+            monitorStatusValueLabel.ForeColor = Color.ForestGreen;
+        }
+        catch (Exception ex)
+        {
+            monitorStatusValueLabel.Text = "Error";
+            monitorStatusValueLabel.ForeColor = Color.Firebrick;
+            AppendLog($"Monitor restart error: {ex.Message}");
+        }
+    }
+
+    private void ValidateMonitorSelection()
+    {
+        var output = FindMonitorOutputEndpoint();
+        if (output is null)
+        {
+            throw new InvalidOperationException("Select a physical monitor output device.");
+        }
+
+        if (IsVbCableEndpoint(output))
+        {
+            throw new InvalidOperationException("Do not monitor into a VB-CABLE endpoint. This may create feedback loop.");
+        }
+
+        foreach (var channelName in MixerChannel.DefaultChannelNames)
+        {
+            if (FindMonitorCaptureEndpoint(channelName) is null)
+            {
+                throw new InvalidOperationException($"Select monitor input for {channelName}.");
+            }
+        }
+    }
+
+    private void UpdateMonitorWarning()
+    {
+        var output = FindMonitorOutputEndpoint();
+        monitorWarningLabel.ForeColor = output is not null && IsVbCableEndpoint(output)
+            ? Color.DarkOrange
+            : Color.FromArgb(190, 196, 205);
+        monitorWarningLabel.Text = output is not null && IsVbCableEndpoint(output)
+            ? "Do not monitor into a VB-CABLE endpoint. This may create feedback loop."
+            : "Use a physical output device. Disable Windows 'Listen to this device' on VB-CABLE outputs to avoid doubled audio.";
+    }
+
+    private static bool IsVbCableEndpoint(AudioEndpoint endpoint)
+        => endpoint.FriendlyName.Contains("CABLE", StringComparison.OrdinalIgnoreCase) ||
+           endpoint.FriendlyName.Contains("VB-Audio", StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizeSliderMode(string? mode)
+    {
+        return mode switch
+        {
+            "App Session Volume" => "App Session Volume",
+            "Monitor Mix Gain" => "Monitor Mix Gain",
+            _ => "Both"
+        };
+    }
+
+    private AudioEndpoint? FindSelectedEndpoint(MixerChannel channel)
+    {
+        if (!string.IsNullOrWhiteSpace(channel.SelectedEndpointId))
+        {
+            var byId = endpoints.FirstOrDefault(endpoint =>
+                endpoint.Id.Equals(channel.SelectedEndpointId, StringComparison.OrdinalIgnoreCase));
+            if (byId is not null)
+            {
+                return byId;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(channel.SelectedEndpointName))
+        {
+            return endpoints.FirstOrDefault(endpoint =>
+                endpoint.FriendlyName.Equals(channel.SelectedEndpointName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return null;
+    }
+
+    private static EndpointChoice? FindChoice(ComboBox comboBox, string endpointId)
+    {
+        return comboBox.Items
+            .OfType<EndpointChoice>()
+            .FirstOrDefault(choice => choice.Endpoint?.Id.Equals(endpointId, StringComparison.OrdinalIgnoreCase) == true);
+    }
+
+    private void HandleEndpointSelectionChanged(ChannelControls controls)
+    {
+        if (controls.IsUpdating)
+        {
+            return;
+        }
+
+        if (controls.EndpointComboBox.SelectedItem is not EndpointChoice choice || choice.Endpoint is null)
+        {
+            controls.Channel.SelectedEndpointId = null;
+            controls.Channel.SelectedEndpointName = null;
+            MarkEndpointUnavailable(controls, "Not found");
+            SaveSettings();
+            return;
+        }
+
+        controls.Channel.SelectedEndpointId = choice.Endpoint.Id;
+        controls.Channel.SelectedEndpointName = choice.Endpoint.FriendlyName;
+        AppendLog($"{controls.Channel.Name} endpoint = {choice.Endpoint.FriendlyName}");
+        SyncChannelFromEndpoint(controls, logErrors: true);
+        SaveSettings();
+    }
+
+    private void SyncChannelFromEndpoint(ChannelControls controls, bool logErrors)
+    {
+        var endpointId = controls.Channel.SelectedEndpointId;
+        if (string.IsNullOrWhiteSpace(endpointId))
+        {
+            MarkEndpointUnavailable(controls, "Not found");
+            return;
+        }
+
+        try
+        {
+            var isMuted = audioEndpointController.GetMute(endpointId);
+
+            controls.Channel.IsMuted = isMuted;
+            if (!IsApplicationSessionMode())
+            {
+                controls.Channel.VolumePercent = audioEndpointController.GetVolumePercent(endpointId);
+            }
+
+            SetVolumeUiValue(controls, controls.Channel.VolumePercent);
+            SetMuteUiValue(controls, isMuted);
+            SetEndpointControlsEnabled(controls, enabled: true);
+            SetStatus(controls, isMuted ? "Muted" : "Found");
+        }
+        catch (Exception ex)
+        {
+            SetEndpointControlsEnabled(controls, enabled: false);
+            SetStatus(controls, "Error");
+
+            if (logErrors)
+            {
+                AppendLog($"{controls.Channel.Name} endpoint error: {ex.Message}");
+            }
+        }
+    }
+
+    private void HandleVolumeChanged(ChannelControls controls)
+    {
+        if (controls.IsUpdating || !controls.VolumeTrackBar.Enabled)
+        {
+            return;
+        }
+
+        ApplyChannelVolume(controls, controls.VolumeTrackBar.Value);
+    }
+
+    private void ApplyChannelVolume(ChannelControls controls, int volumePercent)
+    {
+        volumePercent = Math.Clamp(volumePercent, 0, 100);
+        controls.Channel.VolumePercent = volumePercent;
+        SetVolumeUiValue(controls, volumePercent);
+
+        if (ShouldApplyMonitorMixGain())
+        {
+            var gain = volumePercent / 100f;
+            settings.MonitorMix.ChannelGains[controls.Channel.Name] = gain;
+            monitorMixEngine.SetChannelVolume(controls.Channel.Name, gain);
+            AppendLog($"{controls.Channel.Name} monitor gain = {volumePercent}%");
+        }
+
+        if (ShouldApplyAppSessionVolume())
+        {
+            var processNames = GetProcessNamesForChannel(controls.Channel.Name).ToList();
+            if (processNames.Count > 0)
+            {
+                var results = audioSessionController.SetSessionVolumeForProcesses(
+                    endpoints,
+                    processNames,
+                    controls.Channel.Name,
+                    volumePercent);
+
+                LogSessionVolumeResults(controls.Channel.Name, processNames, volumePercent, results);
+
+                if (results.Any(result => result.Status == "Applied"))
+                {
+                    SetEndpointControlsEnabled(controls, enabled: true);
+                    SetStatus(controls, "Found");
+                    SaveSettings();
+                    RefreshAppSessions();
+                    return;
+                }
+            }
+        }
+
+        if (!ShouldApplyAppSessionVolume())
+        {
+            SaveSettings();
+            return;
+        }
+
+        ApplyEndpointVolumeFallback(controls, volumePercent);
+    }
+
+    private void ApplyEndpointVolumeFallback(ChannelControls controls, int volumePercent)
+    {
+        var endpointId = controls.Channel.SelectedEndpointId;
+        if (string.IsNullOrWhiteSpace(endpointId))
+        {
+            AppendLog($"{controls.Channel.Name} volume ignored: no active routed app session and no endpoint selected.");
+            SaveSettings();
+            return;
+        }
+
+        try
+        {
+            audioEndpointController.SetVolumePercent(endpointId, volumePercent);
+
+            SetEndpointControlsEnabled(controls, enabled: true);
+            SetStatus(controls, controls.Channel.IsMuted ? "Muted" : "Found");
+            AppendLog($"{controls.Channel.Name} endpoint fallback volume = {volumePercent}%");
+            SaveSettings();
+        }
+        catch (Exception ex)
+        {
+            SetStatus(controls, "Error");
+            AppendLog($"{controls.Channel.Name} volume error: {ex.Message}");
+        }
+    }
+
+    private void ToggleChannelMute(ChannelControls controls)
+    {
+        if (ShouldApplyAppSessionVolume() && GetProcessNamesForChannel(controls.Channel.Name).Any())
+        {
+            ApplyChannelMute(controls, !controls.Channel.IsMuted);
+            return;
+        }
+
+        var endpointId = controls.Channel.SelectedEndpointId;
+        if (string.IsNullOrWhiteSpace(endpointId))
+        {
+            AppendLog($"{controls.Channel.Name} mute ignored: no endpoint selected.");
+            return;
+        }
+
+        try
+        {
+            var currentMute = audioEndpointController.GetMute(endpointId);
+            ApplyChannelMute(controls, !currentMute);
+        }
+        catch (Exception ex)
+        {
+            SetStatus(controls, "Error");
+            AppendLog($"{controls.Channel.Name} mute read error: {ex.Message}");
+        }
+    }
+
+    private void ApplyChannelMute(ChannelControls controls, bool isMuted)
+    {
+        if (ShouldApplyMonitorMixGain())
+        {
+            settings.MonitorMix.ChannelMutes[controls.Channel.Name] = isMuted;
+            monitorMixEngine.SetChannelMute(controls.Channel.Name, isMuted);
+            AppendLog($"{controls.Channel.Name} monitor mute = {(isMuted ? "on" : "off")}");
+        }
+
+        if (ShouldApplyAppSessionVolume())
+        {
+            var processNames = GetProcessNamesForChannel(controls.Channel.Name).ToList();
+            if (processNames.Count > 0)
+            {
+                var results = audioSessionController.SetSessionMuteForProcesses(
+                    endpoints,
+                    processNames,
+                    controls.Channel.Name,
+                    isMuted);
+
+                LogSessionMuteResults(controls.Channel.Name, processNames, isMuted, results);
+
+                if (results.Any(result => result.Status == "Applied"))
+                {
+                    controls.Channel.IsMuted = isMuted;
+                    SetMuteUiValue(controls, isMuted);
+                    SetEndpointControlsEnabled(controls, enabled: true);
+                    SetStatus(controls, isMuted ? "Muted" : "Found");
+                    SaveSettings();
+                    RefreshAppSessions();
+                    return;
+                }
+            }
+        }
+
+        if (!ShouldApplyAppSessionVolume())
+        {
+            controls.Channel.IsMuted = isMuted;
+            SetMuteUiValue(controls, isMuted);
+            SetStatus(controls, isMuted ? "Muted" : "Found");
+            SaveSettings();
+            return;
+        }
+
+        var endpointId = controls.Channel.SelectedEndpointId;
+        if (string.IsNullOrWhiteSpace(endpointId))
+        {
+            AppendLog($"{controls.Channel.Name} mute ignored: no active routed app session and no endpoint selected.");
+            return;
+        }
+
+        try
+        {
+            audioEndpointController.SetMute(endpointId, isMuted);
+
+            controls.Channel.IsMuted = isMuted;
+            SetMuteUiValue(controls, isMuted);
+            SetEndpointControlsEnabled(controls, enabled: true);
+            SetStatus(controls, isMuted ? "Muted" : "Found");
+            AppendLog($"{controls.Channel.Name} mute = {(isMuted ? "on" : "off")}");
+            SaveSettings();
+        }
+        catch (Exception ex)
+        {
+            SetStatus(controls, "Error");
+            AppendLog($"{controls.Channel.Name} mute error: {ex.Message}");
+        }
+    }
+
+    private static void SetEndpointControlsEnabled(ChannelControls controls, bool enabled)
+    {
+        controls.StripControl.SetEndpointControlsEnabled(enabled);
+    }
+
+    private void MarkEndpointUnavailable(ChannelControls controls, string status)
+    {
+        SetEndpointControlsEnabled(controls, enabled: false);
+        SetStatus(controls, status);
+    }
+
+    private static void SetVolumeUiValue(ChannelControls controls, int volumePercent)
+    {
+        controls.IsUpdating = true;
+        controls.StripControl.VolumePercent = volumePercent;
+        controls.IsUpdating = false;
+    }
+
+    private static void SetMuteUiValue(ChannelControls controls, bool isMuted)
+    {
+        controls.StripControl.IsMuted = isMuted;
+    }
+
+    private static void SetStatus(ChannelControls controls, string status)
+    {
+        var color = status switch
+        {
+            "Found" => Color.ForestGreen,
+            "Muted" => Color.DarkOrange,
+            "Error" => Color.Firebrick,
+            "Apps" => Color.RoyalBlue,
+            _ => Color.DimGray
+        };
+
+        controls.StripControl.SetStatus(status, color);
+    }
+
+    private void LoadRoutingOptions()
+    {
+        enableExperimentalRoutingCheckBox.Checked = settings.EnableExperimentalAutomaticRouting;
+        autoApplyRoutingRulesCheckBox.Checked = settings.AutoApplyRoutingRules;
+        autoApplyRoutingTimer.Enabled = settings.AutoApplyRoutingRules;
+    }
+
+    private void SetupAppSessionsGrid()
+    {
+        appSessionsGrid.AutoGenerateColumns = false;
+        appSessionsGrid.Columns.Clear();
+
+        appSessionsGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "ProcessName",
+            HeaderText = "Process",
+            ReadOnly = true,
+            FillWeight = 110
+        });
+
+        appSessionsGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "ProcessIds",
+            HeaderText = "PIDs",
+            ReadOnly = true,
+            FillWeight = 90
+        });
+
+        appSessionsGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "SessionCount",
+            HeaderText = "Sessions",
+            ReadOnly = true,
+            FillWeight = 55
+        });
+
+        appSessionsGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "CurrentEndpoints",
+            HeaderText = "Current Endpoints",
+            ReadOnly = true,
+            FillWeight = 170
+        });
+
+        var assignedChannelColumn = new DataGridViewComboBoxColumn
+        {
+            Name = "AssignedChannel",
+            HeaderText = "Channel",
+            FlatStyle = FlatStyle.Flat,
+            FillWeight = 85
+        };
+        assignedChannelColumn.Items.Add("None");
+        foreach (var channelName in MixerChannel.DefaultChannelNames)
+        {
+            assignedChannelColumn.Items.Add(channelName);
+        }
+        appSessionsGrid.Columns.Add(assignedChannelColumn);
+
+        appSessionsGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "TargetEndpoint",
+            HeaderText = "Target Endpoint",
+            ReadOnly = true,
+            FillWeight = 150
+        });
+
+        appSessionsGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "Volume",
+            HeaderText = "Volume",
+            ReadOnly = true,
+            FillWeight = 70
+        });
+
+        appSessionsGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "Status",
+            HeaderText = "Status",
+            ReadOnly = true,
+            FillWeight = 80
+        });
+    }
+
+    private void RefreshAppSessions(bool logDetails = true)
+    {
+        try
+        {
+            appSessions = audioSessionController.GetAudioSessions(endpoints);
+            AssignChannelsToSessions();
+            appGroups = BuildAppGroups();
+            BindAppSessionsGrid();
+            UpdateChannelControlAvailability();
+
+            if (logDetails)
+            {
+                AppendLog($"Found {appSessions.Count} active audio app session(s) across {appGroups.Count} app group(s).");
+                foreach (var group in appGroups)
+                {
+                    AppendLog(
+                        $"App group: {group.ProcessName}, PIDs = {FormatProcessIds(group.ProcessIds)}, sessions = {group.SessionCount}, endpoints = {group.CurrentEndpointsSummary}, target = {group.TargetEndpointFriendlyName}, volume = {group.VolumePercent}%, channel = {group.AssignedChannel}, status = {group.Status}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            appSessions = [];
+            appGroups = [];
+            BindAppSessionsGrid();
+            UpdateChannelControlAvailability();
+            AppendLog($"Audio session refresh error: {ex.Message}");
+        }
+    }
+
+    private void ApplyRouting(bool autoTriggered)
+    {
+        if (autoTriggered)
+        {
+            RefreshAppSessions(logDetails: false);
+        }
+
+        SaveRoutingRulesFromGrid(persist: false);
+        var processed = false;
+        var successfulRoutes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (DataGridViewRow row in appSessionsGrid.Rows)
+        {
+            processed |= row.Tag switch
+            {
+                AudioAppGroup group => ApplyRoutingToGroup(row, group, successfulRoutes, autoTriggered),
+                AudioAppSession session => ApplyRoutingToSession(row, session, successfulRoutes, autoTriggered),
+                _ => false
+            };
+        }
+
+        if (!processed && !autoTriggered)
+        {
+            AppendLog("No assigned application routing rules to apply.");
+        }
+
+        SaveSettings();
+        RefreshAppSessions(logDetails: !autoTriggered);
+        ApplyPostRoutingStatuses(successfulRoutes);
+        LogPostApplyRoutingState(autoTriggered, successfulRoutes);
+    }
+
+    private bool ApplyRoutingToGroup(
+        DataGridViewRow row,
+        AudioAppGroup group,
+        ISet<string> successfulRoutes,
+        bool autoTriggered)
+    {
+        var assignedChannel = row.Cells["AssignedChannel"].Value?.ToString() ?? "None";
+        if (assignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            SetRoutingRowStatus(row, "Active");
+            return false;
+        }
+
+        var target = ResolveTargetEndpoint(assignedChannel, GetRoutingRuleForProcess(group.ProcessName));
+        if (target is null)
+        {
+            SetRoutingRowStatus(row, "Error");
+            LogRoutingMessage(
+                $"missing-target:{group.ProcessName}:{assignedChannel}",
+                $"{group.ProcessName} has no target endpoint for {assignedChannel}. Select the channel endpoint first.",
+                autoTriggered);
+            return true;
+        }
+
+        group.TargetEndpointId = target.Id;
+        group.TargetEndpointFriendlyName = target.FriendlyName;
+        row.Cells["TargetEndpoint"].Value = target.FriendlyName;
+
+        if (group.AreAllSessionsOnTarget())
+        {
+            SetRoutingRowStatus(row, "Already routed");
+            LogRoutingMessage(
+                $"already-group:{group.ProcessName}:{target.Id}",
+                $"{group.ProcessName} is already routed to {target.FriendlyName}.",
+                autoTriggered);
+            return true;
+        }
+
+        if (!settings.EnableExperimentalAutomaticRouting)
+        {
+            SetRoutingRowStatus(row, group.HasAnySessionOnTarget() ? "Partially routed" : "Manual required");
+            LogManualRoutingRequired(group.ProcessName, target.FriendlyName, autoTriggered);
+            return true;
+        }
+
+        LogRoutingGroupAttempt(group, assignedChannel, target, autoTriggered);
+
+        var successCount = 0;
+        var lastStatus = "Error";
+        foreach (var processId in group.ProcessIds)
+        {
+            var result = audioPolicyRouter.TrySetAppOutputDevice(
+                (uint)processId,
+                group.ProcessName,
+                target.Id,
+                target.FriendlyName);
+
+            lastStatus = result.Success ? "Routed preference saved" : result.Status;
+            if (result.Success)
+            {
+                successCount++;
+                successfulRoutes.Add(GetRouteKey(group.ProcessName, target.Id));
+            }
+
+            LogRoutingMessage(
+                $"route-group-pid:{group.ProcessName}:{processId}:{target.Id}:{lastStatus}",
+                $"PID {processId}: {(result.Success ? "preference saved" : result.Status)}",
+                autoTriggered);
+            LogRoutingMessage(
+                $"route:{group.ProcessName}:{processId}:{target.Id}:{lastStatus}",
+                result.Message,
+                autoTriggered);
+            LogRoutingResult(result, autoTriggered);
+        }
+
+        var status = successCount > 0 ? "Routed preference saved" : lastStatus;
+        SetRoutingRowStatus(row, status);
+        LogRoutingMessage(
+            $"route-group-result:{group.ProcessName}:{target.Id}:{status}",
+            $"Group result: {status}",
+            autoTriggered);
+        return true;
+    }
+
+    private bool ApplyRoutingToSession(
+        DataGridViewRow row,
+        AudioAppSession session,
+        ISet<string> successfulRoutes,
+        bool autoTriggered)
+    {
+        var assignedChannel = row.Cells["AssignedChannel"].Value?.ToString() ?? "None";
+        if (assignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            SetRoutingRowStatus(row, "Active");
+            return false;
+        }
+
+        var target = ResolveTargetEndpoint(assignedChannel, GetRoutingRuleForProcess(session.ProcessName));
+        if (target is null)
+        {
+            SetRoutingRowStatus(row, "Error");
+            LogRoutingMessage(
+                $"missing-target:{session.ProcessName}:{assignedChannel}",
+                $"{session.ProcessName} has no target endpoint for {assignedChannel}. Select the channel endpoint first.",
+                autoTriggered);
+            return true;
+        }
+
+        row.Cells["TargetEndpoint"].Value = target.FriendlyName;
+
+        if (session.CurrentEndpointId.Equals(target.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            SetRoutingRowStatus(row, "Already routed");
+            LogRoutingMessage(
+                $"already:{session.ProcessName}:{target.Id}",
+                $"{session.ProcessName} PID {session.ProcessId} is already routed to {target.FriendlyName}.",
+                autoTriggered);
+            return true;
+        }
+
+        if (!settings.EnableExperimentalAutomaticRouting)
+        {
+            SetRoutingRowStatus(row, "Manual required");
+            LogManualRoutingRequired(session.ProcessName, target.FriendlyName, autoTriggered);
+            return true;
+        }
+
+        LogRoutingAttempt(session, assignedChannel, target, autoTriggered);
+
+        var result = audioPolicyRouter.TrySetAppOutputDevice(
+            (uint)session.ProcessId,
+            session.ProcessName,
+            target.Id,
+            target.FriendlyName);
+
+        var status = result.Success ? "Routed preference saved" : result.Status;
+        if (result.Success)
+        {
+            successfulRoutes.Add(GetRouteKey(session.ProcessName, target.Id));
+        }
+
+        SetRoutingRowStatus(row, status);
+        LogRoutingMessage(
+            $"route:{session.ProcessName}:{session.ProcessId}:{target.Id}:{status}",
+            result.Message,
+            autoTriggered);
+        LogRoutingResult(result, autoTriggered);
+        return true;
+    }
+
+    private void ClearRoutingRules()
+    {
+        settings.RoutingRules.Clear();
+        settings.RoutingRulesInitialized = true;
+
+        foreach (DataGridViewRow row in appSessionsGrid.Rows)
+        {
+            row.Cells["AssignedChannel"].Value = "None";
+            row.Cells["TargetEndpoint"].Value = string.Empty;
+            SetRoutingRowStatus(row, "Active");
+        }
+
+        AssignChannelsToSessions();
+        appGroups = BuildAppGroups();
+        UpdateChannelControlAvailability();
+        SaveSettings();
+        AppendLog("Application routing rules cleared.");
+    }
+
+    private void OpenWindowsVolumeMixer()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo("ms-settings:apps-volume") { UseShellExecute = true });
+            AppendLog("Opened Windows Volume Mixer settings.");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Could not open apps volume settings: {ex.Message}");
+            try
+            {
+                Process.Start(new ProcessStartInfo("ms-settings:sound") { UseShellExecute = true });
+                AppendLog("Opened Windows Sound settings.");
+            }
+            catch (Exception fallbackEx)
+            {
+                AppendLog($"Could not open Windows Sound settings: {fallbackEx.Message}");
+            }
+        }
+    }
+
+    private void SetRoutingRowStatus(DataGridViewRow row, string status)
+    {
+        row.Cells["Status"].Value = status;
+        if (row.Tag is AudioAppSession session)
+        {
+            session.Status = status;
+        }
+        else if (row.Tag is AudioAppGroup group)
+        {
+            group.Status = status;
+        }
+
+        row.DefaultCellStyle.ForeColor = status switch
+        {
+            "Already routed" => Color.ForestGreen,
+            "Partially routed" => Color.RoyalBlue,
+            "Routed" => Color.ForestGreen,
+            "Routed preference saved" => Color.RoyalBlue,
+            "Manual required" => Color.DarkOrange,
+            "Restart app may be required" => Color.DarkOrange,
+            "Restart app required" => Color.DarkOrange,
+            "Verification failed" => Color.Firebrick,
+            "Experimental API error" => Color.Firebrick,
+            "Error" => Color.Firebrick,
+            _ => Color.Gainsboro
+        };
+    }
+
+    private void LogRoutingAttempt(AudioAppSession session, string assignedChannel, AudioEndpoint target, bool autoTriggered)
+    {
+        var lines = new[]
+        {
+            $"Routing {session.ProcessName} PID {session.ProcessId}:",
+            $"current endpoint = {session.CurrentEndpointFriendlyName}",
+            $"target channel = {assignedChannel}",
+            $"target endpoint = {target.FriendlyName}",
+            $"target endpoint ID = {target.Id}",
+            $"experimental = {settings.EnableExperimentalAutomaticRouting}"
+        };
+
+        for (var index = 0; index < lines.Length; index++)
+        {
+            LogRoutingMessage(
+                $"routing-attempt:{session.ProcessName}:{session.ProcessId}:{target.Id}:{index}",
+                lines[index],
+                autoTriggered);
+        }
+    }
+
+    private void LogRoutingGroupAttempt(AudioAppGroup group, string assignedChannel, AudioEndpoint target, bool autoTriggered)
+    {
+        var lines = new[]
+        {
+            $"Routing group {group.ProcessName} -> {assignedChannel} / {target.FriendlyName}",
+            $"PIDs = {FormatProcessIds(group.ProcessIds)}",
+            $"sessions = {group.SessionCount}",
+            $"current endpoints = {group.CurrentEndpointsSummary}",
+            $"target endpoint ID = {target.Id}",
+            $"experimental = {settings.EnableExperimentalAutomaticRouting}"
+        };
+
+        for (var index = 0; index < lines.Length; index++)
+        {
+            LogRoutingMessage(
+                $"routing-group-attempt:{group.ProcessName}:{target.Id}:{index}",
+                lines[index],
+                autoTriggered);
+        }
+    }
+
+    private void LogRoutingResult(AppOutputRoutingResult result, bool autoTriggered)
+    {
+        for (var index = 0; index < result.DiagnosticMessages.Count; index++)
+        {
+            LogRoutingMessage(
+                $"routing-diagnostic:{result.ProcessName}:{result.ProcessId}:{result.TargetEndpointId}:{index}:{result.DiagnosticMessages[index]}",
+                result.DiagnosticMessages[index],
+                autoTriggered);
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.ExceptionMessage))
+        {
+            LogRoutingMessage(
+                $"routing-exception:{result.ProcessName}:{result.MethodName}:{result.Role}:{result.HResult}",
+                $"{result.MethodName} failed: HRESULT = {result.HResult}; Exception = {result.ExceptionType}: {result.ExceptionMessage}; Interface implementation = {result.InterfaceImplementation}",
+                autoTriggered);
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.VerificationEndpointId))
+        {
+            LogRoutingMessage(
+                $"routing-verification:{result.ProcessName}:{result.Role}:{result.VerificationEndpointId}",
+                $"GetPersistedDefaultAudioEndpoint returned = {result.VerificationEndpointId}",
+                autoTriggered);
+        }
+    }
+
+    private void LogManualRoutingRequired(string processName, string targetEndpointFriendlyName, bool autoTriggered)
+    {
+        LogRoutingMessage(
+            $"manual:{processName}:{targetEndpointFriendlyName}",
+            $"{processName} should be routed to {targetEndpointFriendlyName}. Open Windows Volume Mixer and set Output device manually.",
+            autoTriggered);
+    }
+
+    private void LogRoutingMessage(string key, string message, bool autoTriggered)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        if (autoTriggered &&
+            lastAutoRoutingMessages.TryGetValue(key, out var previousMessage) &&
+            previousMessage.Equals(message, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (autoTriggered)
+        {
+            lastAutoRoutingMessages[key] = message;
+        }
+
+        AppendLog(message);
+    }
+
+    private AppRoutingRule? GetRoutingRuleForProcess(string processName)
+    {
+        return settings.RoutingRules.FirstOrDefault(rule =>
+            rule.Enabled &&
+            NormalizeProcessName(rule.ProcessName).Equals(NormalizeProcessName(processName), StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void ApplyPostRoutingStatuses(IReadOnlySet<string> successfulRoutes)
+    {
+        foreach (DataGridViewRow row in appSessionsGrid.Rows)
+        {
+            if (row.Tag is AudioAppGroup group)
+            {
+                if (string.IsNullOrWhiteSpace(group.TargetEndpointId) ||
+                    !successfulRoutes.Contains(GetRouteKey(group.ProcessName, group.TargetEndpointId)))
+                {
+                    continue;
+                }
+
+                SetRoutingRowStatus(row, GetPostApplyGroupStatus(group));
+                continue;
+            }
+
+            if (row.Tag is AudioAppSession session &&
+                !string.IsNullOrWhiteSpace(session.TargetEndpointId) &&
+                successfulRoutes.Contains(GetRouteKey(session.ProcessName, session.TargetEndpointId)))
+            {
+                SetRoutingRowStatus(
+                    row,
+                    session.CurrentEndpointId.Equals(session.TargetEndpointId, StringComparison.OrdinalIgnoreCase)
+                        ? "Already routed"
+                        : "Restart app required");
+            }
+        }
+    }
+
+    private void LogPostApplyRoutingState(bool autoTriggered, IReadOnlySet<string> successfulRoutes)
+    {
+        foreach (var group in appGroups)
+        {
+            if (group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(group.TargetEndpointId) ||
+                group.AreAllSessionsOnTarget())
+            {
+                continue;
+            }
+
+            var routeKey = GetRouteKey(group.ProcessName, group.TargetEndpointId);
+            LogRoutingMessage(
+                $"still-not-routed:{routeKey}",
+                successfulRoutes.Contains(routeKey)
+                    ? $"{group.ProcessName}: rule saved; restart app or restart playback may be required."
+                    : $"{group.ProcessName}: rule saved, but app is still on another endpoint. Restart app or set output manually in Windows Volume Mixer.",
+                autoTriggered);
+        }
+    }
+
+    private static string GetRouteKey(string processName, string endpointId)
+        => $"{NormalizeProcessName(processName)}|{endpointId}";
+
+    private void AssignChannelsToSessions()
+    {
+        var rules = GetRoutingRuleMap();
+        foreach (var session in appSessions)
+        {
+            var normalizedProcessName = NormalizeProcessName(session.ProcessName);
+            if (rules.TryGetValue(normalizedProcessName, out var rule))
+            {
+                session.AssignedChannel = rule.PreferredChannel;
+                var target = ResolveTargetEndpoint(rule.PreferredChannel, rule);
+                session.TargetEndpointId = target?.Id;
+                session.TargetEndpointFriendlyName = target?.FriendlyName ?? rule.PreferredEndpointFriendlyName ?? string.Empty;
+                session.Status = GetRoutingStatus(session);
+            }
+            else
+            {
+                session.AssignedChannel = "None";
+                session.TargetEndpointId = null;
+                session.TargetEndpointFriendlyName = string.Empty;
+                session.Status = "Active";
+            }
+        }
+    }
+
+    private IReadOnlyList<AudioAppGroup> BuildAppGroups()
+    {
+        var rules = GetRoutingRuleMap();
+        return appSessions
+            .GroupBy(session => NormalizeProcessName(session.ProcessName), StringComparer.OrdinalIgnoreCase)
+            .Select(group => CreateAppGroup(group.Key, group.ToList(), rules))
+            .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private AudioAppGroup CreateAppGroup(
+        string processName,
+        List<AudioAppSession> sessions,
+        IReadOnlyDictionary<string, AppRoutingRule> rules)
+    {
+        rules.TryGetValue(processName, out var rule);
+        var assignedChannel = rule?.PreferredChannel ?? "None";
+        var target = rule is null ? null : ResolveTargetEndpoint(assignedChannel, rule);
+        var group = new AudioAppGroup
+        {
+            ProcessName = processName,
+            DisplayName = sessions.FirstOrDefault()?.DisplayName ?? processName,
+            Sessions = sessions,
+            ProcessIds = sessions
+                .Select(session => session.ProcessId)
+                .Distinct()
+                .OrderBy(processId => processId)
+                .ToList(),
+            AssignedChannel = assignedChannel,
+            TargetEndpointId = target?.Id,
+            TargetEndpointFriendlyName = target?.FriendlyName ?? rule?.PreferredEndpointFriendlyName ?? string.Empty,
+            Volume = sessions.Count == 0 ? 0f : sessions.Average(session => session.Volume),
+            CurrentEndpointsSummary = FormatEndpointSummary(sessions)
+        };
+
+        group.Status = GetRoutingStatus(group);
+        return group;
+    }
+
+    private void BindAppSessionsGrid()
+    {
+        updatingAppRoutingUi = true;
+        appSessionsGrid.Rows.Clear();
+
+        if (showRawSessionsCheckBox.Checked)
+        {
+            foreach (var session in appSessions)
+            {
+                var rowIndex = appSessionsGrid.Rows.Add(
+                    session.ProcessName,
+                    session.ProcessId > 0 ? session.ProcessId.ToString(CultureInfo.InvariantCulture) : string.Empty,
+                    1,
+                    session.CurrentEndpointFriendlyName,
+                    session.AssignedChannel,
+                    session.TargetEndpointFriendlyName,
+                    $"{session.VolumePercent}%",
+                    session.Status);
+
+                appSessionsGrid.Rows[rowIndex].Tag = session;
+            }
+        }
+        else
+        {
+            foreach (var group in appGroups)
+            {
+                var rowIndex = appSessionsGrid.Rows.Add(
+                    group.ProcessName,
+                    FormatProcessIds(group.ProcessIds),
+                    group.SessionCount,
+                    group.CurrentEndpointsSummary,
+                    group.AssignedChannel,
+                    group.TargetEndpointFriendlyName,
+                    $"{group.VolumePercent}%",
+                    group.Status);
+
+                appSessionsGrid.Rows[rowIndex].Tag = group;
+            }
+        }
+
+        updatingAppRoutingUi = false;
+    }
+
+    private void SaveRoutingRulesFromGrid(bool persist)
+    {
+        if (updatingAppRoutingUi)
+        {
+            return;
+        }
+
+        var rules = GetRoutingRuleMap();
+
+        foreach (DataGridViewRow row in appSessionsGrid.Rows)
+        {
+            var processName = row.Tag switch
+            {
+                AudioAppGroup group => group.ProcessName,
+                AudioAppSession session => session.ProcessName,
+                _ => string.Empty
+            };
+
+            if (string.IsNullOrWhiteSpace(processName))
+            {
+                continue;
+            }
+
+            var selectedChannel = row.Cells["AssignedChannel"].Value?.ToString() ?? "None";
+            if (selectedChannel.Equals("None", StringComparison.OrdinalIgnoreCase) ||
+                !MixerChannel.DefaultChannelNames.Contains(selectedChannel, StringComparer.OrdinalIgnoreCase))
+            {
+                rules.Remove(NormalizeProcessName(processName));
+                continue;
+            }
+
+            var target = ResolveTargetEndpoint(selectedChannel, null);
+            var normalizedProcessName = NormalizeProcessName(processName);
+            rules[normalizedProcessName] = new AppRoutingRule
+            {
+                ProcessName = normalizedProcessName,
+                PreferredChannel = selectedChannel,
+                PreferredEndpointId = target?.Id,
+                PreferredEndpointFriendlyName = target?.FriendlyName,
+                Enabled = true
+            };
+        }
+
+        settings.RoutingRules = rules
+            .OrderBy(rule => rule.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(rule => rule.Value)
+            .ToList();
+
+        AssignChannelsToSessions();
+        appGroups = BuildAppGroups();
+
+        if (persist)
+        {
+            SaveSettings();
+            AppendLog("Application routing rules saved.");
+        }
+    }
+
+    private void UpdateChannelControlAvailability()
+    {
+        foreach (var controls in channelControlsByName.Values)
+        {
+            var activeSessionCount = appSessions.Count(session =>
+                session.AssignedChannel.Equals(controls.Channel.Name, StringComparison.OrdinalIgnoreCase));
+            var endpointSelected = !string.IsNullOrWhiteSpace(controls.Channel.SelectedEndpointId) &&
+                endpoints.Any(endpoint => endpoint.Id.Equals(controls.Channel.SelectedEndpointId, StringComparison.OrdinalIgnoreCase));
+
+            if (activeSessionCount > 0)
+            {
+                SetEndpointControlsEnabled(controls, enabled: true);
+                SetStatus(controls, controls.Channel.IsMuted ? "Muted" : "Apps");
+            }
+            else if (endpointSelected)
+            {
+                SetEndpointControlsEnabled(controls, enabled: true);
+                SetStatus(controls, controls.Channel.IsMuted ? "Muted" : "Found");
+            }
+            else
+            {
+                MarkEndpointUnavailable(controls, "Not found");
+            }
+        }
+    }
+
+    private IEnumerable<string> GetProcessNamesForChannel(string channelName)
+    {
+        return settings.RoutingRules
+            .Where(rule => rule.Enabled && rule.PreferredChannel.Equals(channelName, StringComparison.OrdinalIgnoreCase))
+            .Select(rule => rule.ProcessName);
+    }
+
+    private Dictionary<string, AppRoutingRule> GetRoutingRuleMap()
+    {
+        return settings.RoutingRules
+            .Where(rule => !string.IsNullOrWhiteSpace(rule.ProcessName) &&
+                rule.Enabled &&
+                MixerChannel.DefaultChannelNames.Contains(rule.PreferredChannel, StringComparer.OrdinalIgnoreCase))
+            .GroupBy(rule => NormalizeProcessName(rule.ProcessName), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group =>
+                {
+                    var first = group.First();
+                    first.ProcessName = group.Key;
+                    first.PreferredChannel = MixerChannel.DefaultChannelNames.First(channel =>
+                        channel.Equals(first.PreferredChannel, StringComparison.OrdinalIgnoreCase));
+                    return first;
+                },
+                StringComparer.OrdinalIgnoreCase);
+    }
+
+    private AudioEndpoint? ResolveTargetEndpoint(string channelName, AppRoutingRule? rule)
+    {
+        if (channelControlsByName.TryGetValue(channelName, out var controls))
+        {
+            var selectedEndpointId = controls.Channel.SelectedEndpointId;
+            if (!string.IsNullOrWhiteSpace(selectedEndpointId))
+            {
+                var selectedEndpoint = endpoints.FirstOrDefault(endpoint =>
+                    endpoint.Id.Equals(selectedEndpointId, StringComparison.OrdinalIgnoreCase));
+                if (selectedEndpoint is not null)
+                {
+                    return selectedEndpoint;
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(rule?.PreferredEndpointId))
+        {
+            var savedEndpoint = endpoints.FirstOrDefault(endpoint =>
+                endpoint.Id.Equals(rule.PreferredEndpointId, StringComparison.OrdinalIgnoreCase));
+            if (savedEndpoint is not null)
+            {
+                return savedEndpoint;
+            }
+        }
+
+        return null;
+    }
+
+    private static string GetRoutingStatus(AudioAppSession session)
+    {
+        if (session.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Active";
+        }
+
+        if (string.IsNullOrWhiteSpace(session.TargetEndpointId))
+        {
+            return "Error";
+        }
+
+        return session.CurrentEndpointId.Equals(session.TargetEndpointId, StringComparison.OrdinalIgnoreCase)
+            ? "Already routed"
+            : "Manual required";
+    }
+
+    private static string GetRoutingStatus(AudioAppGroup group)
+    {
+        if (group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Active";
+        }
+
+        if (string.IsNullOrWhiteSpace(group.TargetEndpointId))
+        {
+            return "Error";
+        }
+
+        if (group.AreAllSessionsOnTarget())
+        {
+            return "Already routed";
+        }
+
+        return group.HasAnySessionOnTarget() ? "Partially routed" : "Manual required";
+    }
+
+    private static string GetPostApplyGroupStatus(AudioAppGroup group)
+    {
+        if (group.AreAllSessionsOnTarget())
+        {
+            return "Already routed";
+        }
+
+        return group.HasAnySessionOnTarget() ? "Partially routed" : "Restart app required";
+    }
+
+    private static string FormatEndpointSummary(IEnumerable<AudioAppSession> sessions)
+    {
+        var endpointNames = sessions
+            .Select(session => session.CurrentEndpointFriendlyName)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return endpointNames.Count == 0 ? "Unknown" : string.Join(", ", endpointNames);
+    }
+
+    private static string FormatProcessIds(IEnumerable<int> processIds)
+    {
+        var formattedProcessIds = processIds
+            .Where(processId => processId > 0)
+            .Distinct()
+            .OrderBy(processId => processId)
+            .Select(processId => processId.ToString(CultureInfo.InvariantCulture))
+            .ToList();
+
+        return formattedProcessIds.Count == 0 ? "System" : string.Join(", ", formattedProcessIds);
+    }
+
+    private void LogSessionVolumeResults(
+        string channelName,
+        IReadOnlyCollection<string> processNames,
+        int volumePercent,
+        IReadOnlyList<AudioSessionActionResult> results)
+    {
+        if (results.Count == 0)
+        {
+            AppendLog($"{channelName}: no active audio sessions matched {string.Join(", ", processNames)}; using endpoint fallback.");
+            return;
+        }
+
+        foreach (var result in results)
+        {
+            if (result.Status == "Applied")
+            {
+                AppendLog($"{channelName}: {result.ProcessName} session volume = {volumePercent}%");
+            }
+            else
+            {
+                AppendLog($"{channelName}: {result.ProcessName} session volume error: {result.ErrorMessage}");
+            }
+        }
+    }
+
+    private void LogSessionMuteResults(
+        string channelName,
+        IReadOnlyCollection<string> processNames,
+        bool muted,
+        IReadOnlyList<AudioSessionActionResult> results)
+    {
+        if (results.Count == 0)
+        {
+            AppendLog($"{channelName}: no active audio sessions matched {string.Join(", ", processNames)}; using endpoint fallback.");
+            return;
+        }
+
+        foreach (var result in results)
+        {
+            if (result.Status == "Applied")
+            {
+                AppendLog($"{channelName}: {result.ProcessName} session mute = {(muted ? "on" : "off")}");
+            }
+            else
+            {
+                AppendLog($"{channelName}: {result.ProcessName} session mute error: {result.ErrorMessage}");
+            }
+        }
+    }
+
+    private bool IsApplicationSessionMode()
+    {
+        return settings.ChannelVolumeMode.Equals("ApplicationSessions", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool ShouldApplyAppSessionVolume()
+    {
+        var mode = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
+        return mode is "Both" or "App Session Volume";
+    }
+
+    private bool ShouldApplyMonitorMixGain()
+    {
+        var mode = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
+        return mode is "Both" or "Monitor Mix Gain";
+    }
+
+    private static string NormalizeProcessName(string processName)
+    {
+        var normalized = processName.Trim();
+        if (normalized.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        if (normalized.Equals("System Sounds", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith("pid:", StringComparison.OrdinalIgnoreCase))
+        {
+            return normalized;
+        }
+
+        return normalized.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            ? normalized
+            : normalized + ".exe";
+    }
+
+    private void LoadSerialSettings()
+    {
+        updatingSerialUi = true;
+        baudRateTextBox.Text = settings.SerialBaudRate.ToString(CultureInfo.InvariantCulture);
+        updatingSerialUi = false;
+    }
+
+    private void RefreshComPorts()
+    {
+        updatingSerialUi = true;
+
+        var selectedPort = settings.SelectedComPort;
+        var ports = SerialController.GetPortNames().ToList();
+        if (!string.IsNullOrWhiteSpace(selectedPort) &&
+            !ports.Contains(selectedPort, StringComparer.OrdinalIgnoreCase))
+        {
+            ports.Add(selectedPort);
+        }
+
+        serialPortComboBox.Items.Clear();
+        foreach (var port in ports.OrderBy(port => port, StringComparer.OrdinalIgnoreCase))
+        {
+            serialPortComboBox.Items.Add(port);
+        }
+
+        serialPortComboBox.SelectedItem = !string.IsNullOrWhiteSpace(selectedPort) &&
+            serialPortComboBox.Items.Contains(selectedPort)
+                ? selectedPort
+                : null;
+
+        updatingSerialUi = false;
+        AppendLog($"Found {ports.Count} COM port(s).");
+    }
+
+    private void ToggleSerialConnection()
+    {
+        if (serialController.IsConnected)
+        {
+            serialController.Disconnect();
+            serialStatusValueLabel.Text = "Disconnected";
+            connectSerialButton.Text = "Connect";
+            AppendLog("Serial disconnected.");
+            return;
+        }
+
+        if (serialPortComboBox.SelectedItem is not string portName || string.IsNullOrWhiteSpace(portName))
+        {
+            AppendLog("Select a COM port before connecting.");
+            return;
+        }
+
+        if (!TryReadBaudRate(out var baudRate))
+        {
+            AppendLog("Baud rate must be a positive integer.");
+            return;
+        }
+
+        try
+        {
+            serialController.Connect(portName, baudRate);
+            settings.SelectedComPort = portName;
+            settings.SerialBaudRate = baudRate;
+            SaveSettings();
+
+            serialStatusValueLabel.Text = $"Connected to {portName} @ {baudRate}";
+            connectSerialButton.Text = "Disconnect";
+            AppendLog($"Serial connected: {portName} @ {baudRate}.");
+        }
+        catch (Exception ex)
+        {
+            serialStatusValueLabel.Text = "Error";
+            AppendLog($"Serial connect error: {ex.Message}");
+        }
+    }
+
+    private void SaveSerialSelection()
+    {
+        if (updatingSerialUi)
+        {
+            return;
+        }
+
+        settings.SelectedComPort = serialPortComboBox.SelectedItem as string;
+        SaveSettings();
+    }
+
+    private void SaveBaudRateIfValid()
+    {
+        if (updatingSerialUi)
+        {
+            return;
+        }
+
+        if (TryReadBaudRate(out var baudRate))
+        {
+            settings.SerialBaudRate = baudRate;
+            SaveSettings();
+        }
+    }
+
+    private bool TryReadBaudRate(out int baudRate)
+    {
+        return int.TryParse(
+                baudRateTextBox.Text.Trim(),
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out baudRate) &&
+            baudRate > 0;
+    }
+
+    private void HandleSerialCommand(SerialCommandReceivedEventArgs args)
+    {
+        AppendLog($"Serial command: {args.Line}");
+
+        if (!channelControlsByName.TryGetValue(args.Command.ChannelName, out var controls))
+        {
+            AppendLog($"Serial command ignored: unknown channel {args.Command.ChannelName}.");
+            return;
+        }
+
+        switch (args.Command.Type)
+        {
+            case SerialCommandType.SetVolume when args.Command.VolumePercent is int volumePercent:
+                ApplyChannelVolume(controls, volumePercent);
+                break;
+            case SerialCommandType.SetMute when args.Command.IsMuted is bool isMuted:
+                ApplyChannelMute(controls, isMuted);
+                break;
+            default:
+                AppendLog($"Serial command ignored: incomplete command for {args.Command.ChannelName}.");
+                break;
+        }
+    }
+
+    private void SaveSettings()
+    {
+        settings.Channels = channels;
+        settings.RoutingRulesInitialized = true;
+
+        try
+        {
+            settingsService.Save(settings);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Settings save error: {ex.Message}");
+        }
+    }
+
+    private void AppendLog(string message)
+    {
+        if (logTextBox.IsDisposed)
+        {
+            return;
+        }
+
+        var line = $"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}";
+        var shouldAutoScroll = autoScrollLogCheckBox?.Checked ?? true;
+        var selectionStart = logTextBox.SelectionStart;
+        var selectionLength = logTextBox.SelectionLength;
+        logTextBox.AppendText(line);
+        if (!shouldAutoScroll)
+        {
+            logTextBox.SelectionStart = Math.Min(selectionStart, logTextBox.TextLength);
+            logTextBox.SelectionLength = Math.Min(selectionLength, logTextBox.TextLength - logTextBox.SelectionStart);
+        }
+    }
+
+    private void RunOnUiThread(Action action)
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        if (!InvokeRequired)
+        {
+            action();
+            return;
+        }
+
+        try
+        {
+            BeginInvoke(action);
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    private sealed class ChannelControls(
+        MixerChannel channel,
+        ChannelStripControl stripControl)
+    {
+        public MixerChannel Channel { get; } = channel;
+
+        public ChannelStripControl StripControl { get; } = stripControl;
+
+        public ComboBox EndpointComboBox => StripControl.EndpointComboBox;
+
+        public TrackBar VolumeTrackBar => StripControl.VolumeTrackBar;
+
+        public Button MuteButton => StripControl.MuteButton;
+
+        public Label StatusLabel => StripControl.StatusLabel;
+
+        public bool IsUpdating { get; set; }
+    }
+
+    private sealed class EndpointChoice
+    {
+        public static readonly EndpointChoice Empty = new(null);
+
+        public EndpointChoice(AudioEndpoint? endpoint)
+        {
+            Endpoint = endpoint;
+        }
+
+        public AudioEndpoint? Endpoint { get; }
+
+        public override string ToString() => Endpoint?.DisplayName ?? "Select endpoint...";
+    }
+}
