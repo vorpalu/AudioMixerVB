@@ -28,6 +28,9 @@ public partial class MainForm : Form
     private bool updatingMonitorUi;
     private bool updatingStreamUi;
     private bool updatingSerialUi;
+    private bool monitorOperationInProgress;
+    private bool streamOperationInProgress;
+    private bool allowCloseAfterAudioStop;
 
     private GroupBox monitorMixGroupBox = null!;
     private TableLayoutPanel monitorMixLayout = null!;
@@ -79,6 +82,8 @@ public partial class MainForm : Form
         LoadRoutingOptions();
         BuildChannelPanels();
         BuildLogTools();
+        SetMonitorButtons(isRunning: false, operationInProgress: false);
+        SetStreamButtons(isRunning: false, operationInProgress: false);
         ApplyDarkTheme();
         WireEvents();
         LoadSerialSettings();
@@ -111,12 +116,56 @@ public partial class MainForm : Form
         }
     }
 
+    protected override async void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!allowCloseAfterAudioStop && ShouldStopAudioBeforeClose())
+        {
+            e.Cancel = true;
+            Enabled = false;
+            AppendLog("Stopping audio engines before close.");
+
+            await StopAudioBeforeCloseAsync();
+
+            allowCloseAfterAudioStop = true;
+            RunOnUiThread(Close);
+            return;
+        }
+
+        base.OnFormClosing(e);
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         monitorMixEngine.Dispose();
         streamMixEngine.Dispose();
         serialController.Dispose();
         base.OnFormClosed(e);
+    }
+
+    private bool ShouldStopAudioBeforeClose()
+        => monitorMixEngine.IsRunning ||
+           monitorMixEngine.IsStopping ||
+           streamMixEngine.IsRunning ||
+           streamMixEngine.IsStopping;
+
+    private async Task StopAudioBeforeCloseAsync()
+    {
+        try
+        {
+            var stopTask = Task.WhenAll(monitorMixEngine.StopAsync(), streamMixEngine.StopAsync());
+            var completedTask = await Task.WhenAny(stopTask, Task.Delay(TimeSpan.FromSeconds(5)));
+            if (completedTask != stopTask)
+            {
+                AppendLog("Audio stop timed out during close; closing anyway.");
+                return;
+            }
+
+            await stopTask;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Audio stop during close error: {ex.Message}");
+        }
     }
 
     private void WireEvents()
@@ -129,15 +178,15 @@ public partial class MainForm : Form
         monitorMediaInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Media", monitorMediaInputComboBox);
         channelSliderModeComboBox.SelectedIndexChanged += (_, _) => HandleChannelSliderModeChanged();
         startMonitorButton.Click += (_, _) => StartMonitor();
-        stopMonitorButton.Click += (_, _) => StopMonitor();
-        restartMonitorButton.Click += (_, _) => RestartMonitor();
+        stopMonitorButton.Click += async (_, _) => await StopMonitorAsync();
+        restartMonitorButton.Click += async (_, _) => await RestartMonitorAsync();
         streamOutputComboBox.SelectedIndexChanged += (_, _) => HandleStreamOutputChanged();
         streamLatencyNumericUpDown.ValueChanged += (_, _) => HandleStreamLatencyChanged();
         streamMasterStripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleStreamMasterGainChanged();
         streamMasterStripControl.MuteButton.Click += (_, _) => ToggleStreamMasterMute();
         startStreamButton.Click += (_, _) => StartStreamMix();
-        stopStreamButton.Click += (_, _) => StopStreamMix();
-        restartStreamButton.Click += (_, _) => RestartStreamMix();
+        stopStreamButton.Click += async (_, _) => await StopStreamMixAsync();
+        restartStreamButton.Click += async (_, _) => await RestartStreamMixAsync();
         refreshAppsButton.Click += (_, _) => RefreshAppSessions();
         applyRoutingButton.Click += (_, _) => ApplyRouting(autoTriggered: false);
         saveRoutingRulesButton.Click += (_, _) => SaveRoutingRulesFromGrid(persist: true);
@@ -1118,6 +1167,11 @@ public partial class MainForm : Form
 
     private void StartMonitor()
     {
+        if (monitorOperationInProgress)
+        {
+            return;
+        }
+
         try
         {
             ValidateMonitorSelection();
@@ -1125,30 +1179,67 @@ public partial class MainForm : Form
             monitorMixEngine.Start();
             monitorStatusValueLabel.Text = "Running";
             monitorStatusValueLabel.ForeColor = Color.ForestGreen;
+            SetMonitorButtons(isRunning: true, operationInProgress: false);
             SaveSettings();
         }
         catch (Exception ex)
         {
             monitorStatusValueLabel.Text = "Error";
             monitorStatusValueLabel.ForeColor = Color.Firebrick;
+            SetMonitorButtons(isRunning: monitorMixEngine.IsRunning, operationInProgress: false);
             AppendLog($"Monitor start error: {ex.Message}");
         }
     }
 
-    private void StopMonitor()
+    private async Task StopMonitorAsync()
     {
-        monitorMixEngine.Stop();
-        monitorStatusValueLabel.Text = "Stopped";
-        monitorStatusValueLabel.ForeColor = Color.DimGray;
+        if (monitorOperationInProgress)
+        {
+            return;
+        }
+
+        monitorOperationInProgress = true;
+        monitorStatusValueLabel.Text = "Stopping...";
+        monitorStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetMonitorButtons(isRunning: true, operationInProgress: true);
+
+        try
+        {
+            await monitorMixEngine.StopAsync();
+            monitorStatusValueLabel.Text = "Stopped";
+            monitorStatusValueLabel.ForeColor = Color.DimGray;
+        }
+        catch (Exception ex)
+        {
+            monitorStatusValueLabel.Text = "Error";
+            monitorStatusValueLabel.ForeColor = Color.Firebrick;
+            AppendLog($"Monitor stop error: {ex.Message}");
+        }
+        finally
+        {
+            monitorOperationInProgress = false;
+            SetMonitorButtons(isRunning: monitorMixEngine.IsRunning, operationInProgress: false);
+        }
     }
 
-    private void RestartMonitor()
+    private async Task RestartMonitorAsync()
     {
+        if (monitorOperationInProgress)
+        {
+            return;
+        }
+
+        monitorOperationInProgress = true;
+        monitorStatusValueLabel.Text = "Restarting...";
+        monitorStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetMonitorButtons(isRunning: true, operationInProgress: true);
+
         try
         {
             ValidateMonitorSelection();
+            await monitorMixEngine.StopAsync();
             ApplyMonitorSettingsToEngine();
-            monitorMixEngine.Restart();
+            monitorMixEngine.Start();
             monitorStatusValueLabel.Text = "Running";
             monitorStatusValueLabel.ForeColor = Color.ForestGreen;
         }
@@ -1158,6 +1249,18 @@ public partial class MainForm : Form
             monitorStatusValueLabel.ForeColor = Color.Firebrick;
             AppendLog($"Monitor restart error: {ex.Message}");
         }
+        finally
+        {
+            monitorOperationInProgress = false;
+            SetMonitorButtons(isRunning: monitorMixEngine.IsRunning, operationInProgress: false);
+        }
+    }
+
+    private void SetMonitorButtons(bool isRunning, bool operationInProgress)
+    {
+        startMonitorButton.Enabled = !operationInProgress && !isRunning;
+        stopMonitorButton.Enabled = !operationInProgress && isRunning;
+        restartMonitorButton.Enabled = !operationInProgress;
     }
 
     private void ValidateMonitorSelection()
@@ -1312,6 +1415,11 @@ public partial class MainForm : Form
 
     private void StartStreamMix()
     {
+        if (streamOperationInProgress)
+        {
+            return;
+        }
+
         try
         {
             ValidateStreamSelection();
@@ -1319,30 +1427,67 @@ public partial class MainForm : Form
             streamMixEngine.Start();
             streamStatusValueLabel.Text = "Running";
             streamStatusValueLabel.ForeColor = Color.ForestGreen;
+            SetStreamButtons(isRunning: true, operationInProgress: false);
             SaveSettings();
         }
         catch (Exception ex)
         {
             streamStatusValueLabel.Text = "Error";
             streamStatusValueLabel.ForeColor = Color.Firebrick;
+            SetStreamButtons(isRunning: streamMixEngine.IsRunning, operationInProgress: false);
             AppendLog($"Stream start error: {ex.Message}");
         }
     }
 
-    private void StopStreamMix()
+    private async Task StopStreamMixAsync()
     {
-        streamMixEngine.Stop();
-        streamStatusValueLabel.Text = "Stopped";
-        streamStatusValueLabel.ForeColor = Color.DimGray;
+        if (streamOperationInProgress)
+        {
+            return;
+        }
+
+        streamOperationInProgress = true;
+        streamStatusValueLabel.Text = "Stopping...";
+        streamStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetStreamButtons(isRunning: true, operationInProgress: true);
+
+        try
+        {
+            await streamMixEngine.StopAsync();
+            streamStatusValueLabel.Text = "Stopped";
+            streamStatusValueLabel.ForeColor = Color.DimGray;
+        }
+        catch (Exception ex)
+        {
+            streamStatusValueLabel.Text = "Error";
+            streamStatusValueLabel.ForeColor = Color.Firebrick;
+            AppendLog($"Stream stop error: {ex.Message}");
+        }
+        finally
+        {
+            streamOperationInProgress = false;
+            SetStreamButtons(isRunning: streamMixEngine.IsRunning, operationInProgress: false);
+        }
     }
 
-    private void RestartStreamMix()
+    private async Task RestartStreamMixAsync()
     {
+        if (streamOperationInProgress)
+        {
+            return;
+        }
+
+        streamOperationInProgress = true;
+        streamStatusValueLabel.Text = "Restarting...";
+        streamStatusValueLabel.ForeColor = Color.DarkOrange;
+        SetStreamButtons(isRunning: true, operationInProgress: true);
+
         try
         {
             ValidateStreamSelection();
+            await streamMixEngine.StopAsync();
             ApplyStreamSettingsToEngine();
-            streamMixEngine.Restart();
+            streamMixEngine.Start();
             streamStatusValueLabel.Text = "Running";
             streamStatusValueLabel.ForeColor = Color.ForestGreen;
         }
@@ -1352,6 +1497,18 @@ public partial class MainForm : Form
             streamStatusValueLabel.ForeColor = Color.Firebrick;
             AppendLog($"Stream restart error: {ex.Message}");
         }
+        finally
+        {
+            streamOperationInProgress = false;
+            SetStreamButtons(isRunning: streamMixEngine.IsRunning, operationInProgress: false);
+        }
+    }
+
+    private void SetStreamButtons(bool isRunning, bool operationInProgress)
+    {
+        startStreamButton.Enabled = !operationInProgress && !isRunning;
+        stopStreamButton.Enabled = !operationInProgress && isRunning;
+        restartStreamButton.Enabled = !operationInProgress;
     }
 
     private void ValidateStreamSelection()
@@ -2874,7 +3031,7 @@ public partial class MainForm : Form
 
     private void AppendLog(string message)
     {
-        if (logTextBox.IsDisposed)
+        if (logTextBox.IsDisposed || Disposing || IsDisposed)
         {
             return;
         }
@@ -2893,7 +3050,7 @@ public partial class MainForm : Form
 
     private void RunOnUiThread(Action action)
     {
-        if (IsDisposed)
+        if (IsDisposed || Disposing || !IsHandleCreated)
         {
             return;
         }
@@ -2907,6 +3064,9 @@ public partial class MainForm : Form
         try
         {
             BeginInvoke(action);
+        }
+        catch (ObjectDisposedException)
+        {
         }
         catch (InvalidOperationException)
         {

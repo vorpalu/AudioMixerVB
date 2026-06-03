@@ -21,6 +21,7 @@ public sealed class StreamMixEngine : IDisposable
     private MasterSampleProvider? masterProvider;
     private string? outputEndpointId;
     private bool disposed;
+    private bool isStopping;
     private float masterGain = 1f;
     private bool masterMuted;
 
@@ -39,6 +40,17 @@ public sealed class StreamMixEngine : IDisposable
     public event EventHandler<Exception>? OnError;
 
     public bool IsRunning { get; private set; }
+
+    public bool IsStopping
+    {
+        get
+        {
+            lock (syncRoot)
+            {
+                return isStopping;
+            }
+        }
+    }
 
     public int LatencyMs { get; set; } = 60;
 
@@ -146,6 +158,11 @@ public sealed class StreamMixEngine : IDisposable
                 return;
             }
 
+            if (isStopping)
+            {
+                throw new InvalidOperationException("Stream mix engine is stopping.");
+            }
+
             if (string.IsNullOrWhiteSpace(outputEndpointId))
             {
                 throw new InvalidOperationException("Select a stream output device before starting.");
@@ -161,27 +178,28 @@ public sealed class StreamMixEngine : IDisposable
             }
             catch
             {
-                StopLocked();
+                StopCore();
                 throw;
             }
         }
     }
 
     public void Stop()
-    {
-        lock (syncRoot)
-        {
-            StopLocked();
-        }
-    }
+        => StopCore();
+
+    public Task StopAsync()
+        => Task.Run(StopCore);
 
     public void Restart()
     {
-        lock (syncRoot)
-        {
-            StopLocked();
-            Start();
-        }
+        Stop();
+        Start();
+    }
+
+    public async Task RestartAsync()
+    {
+        await StopAsync().ConfigureAwait(false);
+        Start();
     }
 
     public void Dispose()
@@ -193,9 +211,10 @@ public sealed class StreamMixEngine : IDisposable
                 return;
             }
 
-            StopLocked();
             disposed = true;
         }
+
+        Stop();
     }
 
     private void StartLocked()
@@ -226,8 +245,13 @@ public sealed class StreamMixEngine : IDisposable
                 ReadFully = true
             };
 
-            capture.DataAvailable += (_, args) =>
+            EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
             {
+                if (IsStopping)
+                {
+                    return;
+                }
+
                 try
                 {
                     bufferedProvider.AddSamples(args.Buffer, 0, args.BytesRecorded);
@@ -238,14 +262,21 @@ public sealed class StreamMixEngine : IDisposable
                     OnLog?.Invoke(this, $"Stream capture error for {channelName}: {ex.Message}");
                 }
             };
-            capture.RecordingStopped += (_, args) =>
+            EventHandler<StoppedEventArgs> recordingStoppedHandler = (_, args) =>
             {
+                if (IsStopping)
+                {
+                    return;
+                }
+
                 if (args.Exception is not null)
                 {
                     OnError?.Invoke(this, args.Exception);
                     OnLog?.Invoke(this, $"Stream capture stopped with error for {channelName}: {args.Exception.Message}");
                 }
             };
+            capture.DataAvailable += dataAvailableHandler;
+            capture.RecordingStopped += recordingStoppedHandler;
 
             ISampleProvider sampleProvider = bufferedProvider.ToSampleProvider();
             sampleProvider = EnsureStereo(sampleProvider);
@@ -264,7 +295,12 @@ public sealed class StreamMixEngine : IDisposable
 
             activeProviders[channelName] = gainProvider;
             mixer.AddMixerInput(gainProvider);
-            captureChannels.Add(new CaptureChannel(channelName, capture, bufferedProvider));
+            captureChannels.Add(new CaptureChannel(
+                channelName,
+                capture,
+                bufferedProvider,
+                dataAvailableHandler,
+                recordingStoppedHandler));
             OnLog?.Invoke(this, $"Started stream capture for {channelName}: {captureDevice.FriendlyName}");
         }
 
@@ -286,47 +322,97 @@ public sealed class StreamMixEngine : IDisposable
         OnLog?.Invoke(this, "Started stream output.");
     }
 
-    private void StopLocked()
+    private void StopCore()
     {
-        if (!IsRunning && output is null && captureChannels.Count == 0)
+        List<CaptureChannel> capturesToStop;
+        WasapiOut? outputToStop;
+
+        OnLog?.Invoke(this, "Stream Stop requested.");
+
+        lock (syncRoot)
         {
-            return;
+            if (isStopping)
+            {
+                OnLog?.Invoke(this, "Stream stop ignored; stop already in progress.");
+                return;
+            }
+
+            if (!IsRunning && output is null && captureChannels.Count == 0)
+            {
+                return;
+            }
+
+            isStopping = true;
+            capturesToStop = captureChannels.ToList();
+            outputToStop = output;
+            captureChannels.Clear();
+            activeProviders.Clear();
+            output = null;
+            masterProvider = null;
+            IsRunning = false;
         }
 
-        OnLog?.Invoke(this, "Stopping stream mix engine.");
+        OnLog?.Invoke(this, "Stream stopping captures...");
 
-        foreach (var channel in captureChannels.ToList())
+        foreach (var channel in capturesToStop)
         {
+            channel.DetachHandlers();
+
             try
             {
                 channel.Capture.StopRecording();
             }
             catch (Exception ex)
             {
-                OnLog?.Invoke(this, $"Stop stream capture error for {channel.ChannelName}: {ex.Message}");
+                OnError?.Invoke(this, ex);
+                OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
             }
 
-            channel.Dispose();
+            try
+            {
+                channel.Dispose();
+                OnLog?.Invoke(this, $"Stream capture disposed: {channel.ChannelName}");
+            }
+            catch (Exception ex)
+            {
+                OnError?.Invoke(this, ex);
+                OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
+            }
         }
 
-        captureChannels.Clear();
-        activeProviders.Clear();
-        ResetMeters();
+        OnLog?.Invoke(this, "Stream stopping output...");
 
         try
         {
-            output?.Stop();
+            outputToStop?.Stop();
         }
         catch (Exception ex)
         {
-            OnLog?.Invoke(this, $"Stop stream output error: {ex.Message}");
+            OnError?.Invoke(this, ex);
+            OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
         }
 
-        output?.Dispose();
-        output = null;
-        masterProvider = null;
-        IsRunning = false;
-        OnLog?.Invoke(this, "Stopped stream mix engine.");
+        try
+        {
+            outputToStop?.Dispose();
+            if (outputToStop is not null)
+            {
+                OnLog?.Invoke(this, "Stream output disposed.");
+            }
+        }
+        catch (Exception ex)
+        {
+            OnError?.Invoke(this, ex);
+            OnLog?.Invoke(this, $"Stream stop error: {ex.Message}");
+        }
+
+        lock (syncRoot)
+        {
+            ResetMeters();
+            isStopping = false;
+        }
+
+        OnLog?.Invoke(this, "Stream stopped.");
     }
 
     private static MMDevice FindDevice(string endpointId, NAudio.CoreAudioApi.DataFlow dataFlow)
@@ -388,13 +474,21 @@ public sealed class StreamMixEngine : IDisposable
     private sealed class CaptureChannel(
         string channelName,
         WasapiCapture capture,
-        BufferedWaveProvider bufferedProvider) : IDisposable
+        BufferedWaveProvider bufferedProvider,
+        EventHandler<WaveInEventArgs> dataAvailableHandler,
+        EventHandler<StoppedEventArgs> recordingStoppedHandler) : IDisposable
     {
         public string ChannelName { get; } = channelName;
 
         public WasapiCapture Capture { get; } = capture;
 
         public BufferedWaveProvider BufferedProvider { get; } = bufferedProvider;
+
+        public void DetachHandlers()
+        {
+            Capture.DataAvailable -= dataAvailableHandler;
+            Capture.RecordingStopped -= recordingStoppedHandler;
+        }
 
         public void Dispose()
         {
