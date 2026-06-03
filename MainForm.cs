@@ -16,6 +16,10 @@ public partial class MainForm : Form
     private readonly SerialController serialController = new();
     private readonly Dictionary<string, ChannelControls> channelControlsByName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> lastAutoRoutingMessages = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, AutoRoutingAttempt> lastAutoRoutingAttempts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> channelAppChipSignatures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TimeSpan autoRefreshInterval = TimeSpan.FromSeconds(5);
+    private readonly TimeSpan autoRoutingCooldown = TimeSpan.FromSeconds(15);
     private readonly List<MixerChannel> channels;
 
     private AppSettings settings;
@@ -29,7 +33,12 @@ public partial class MainForm : Form
     private bool updatingSerialUi;
     private bool monitorOperationInProgress;
     private bool streamOperationInProgress;
+    private bool isRefreshingApps;
+    private bool isApplyingRouting;
+    private bool mixerDropTargetsRegistered;
     private bool allowCloseAfterAudioStop;
+    private DateTime lastRefreshAppsUtc = DateTime.MinValue;
+    private string unassignedAppChipSignature = "\u0000";
 
     private GroupBox monitorMixGroupBox = null!;
     private TableLayoutPanel monitorMixLayout = null!;
@@ -66,8 +75,8 @@ public partial class MainForm : Form
     public MainForm()
     {
         InitializeComponent();
-        audioEndpointController.LogMessage += (_, message) => AppendLog(message);
-        audioSessionController.LogMessage += (_, message) => AppendLog(message);
+        audioEndpointController.LogMessage += (_, message) => RunOnUiThread(() => AppendLog(message));
+        audioSessionController.LogMessage += (_, message) => RunOnUiThread(() => AppendLog(message));
         monitorMixEngine.OnLog += (_, message) => RunOnUiThread(() => AppendLog(message));
         monitorMixEngine.OnError += (_, ex) => RunOnUiThread(() => AppendLog($"Monitor error: {ex.Message}"));
         streamMixEngine.OnLog += (_, message) => RunOnUiThread(() => AppendLog(message));
@@ -90,7 +99,11 @@ public partial class MainForm : Form
         LoadSerialSettings();
         RefreshComPorts();
         RefreshEndpoints(applyFirstRunAutoMapping: !settingsFileLoaded);
-        RefreshAppSessions();
+        Shown += async (_, _) =>
+        {
+            RegisterMixerDropTargets();
+            await RefreshAppSessionsAsync(logDetails: true, force: true, bindGrid: true);
+        };
         if (settings.MonitorMix.EnabledOnStartup)
         {
             StartMonitor();
@@ -190,7 +203,7 @@ public partial class MainForm : Form
         startStreamButton.Click += (_, _) => StartStreamMix();
         stopStreamButton.Click += async (_, _) => await StopStreamMixAsync();
         restartStreamButton.Click += async (_, _) => await RestartStreamMixAsync();
-        refreshAppsButton.Click += (_, _) => RefreshAppSessions();
+        refreshAppsButton.Click += async (_, _) => await RefreshAppSessionsAsync(logDetails: true, force: true, bindGrid: true);
         applyRoutingButton.Click += (_, _) => ApplyRouting(autoTriggered: false);
         saveRoutingRulesButton.Click += (_, _) => SaveRoutingRulesFromGrid(persist: true);
         clearRoutingButton.Click += (_, _) => ClearRoutingRules();
@@ -206,7 +219,7 @@ public partial class MainForm : Form
             autoApplyRoutingTimer.Enabled = settings.AutoApplyRoutingRules;
             SaveSettings();
         };
-        autoApplyRoutingTimer.Tick += (_, _) => ApplyRouting(autoTriggered: true);
+        autoApplyRoutingTimer.Tick += async (_, _) => await HandleAutoApplyTimerTickAsync();
         meterUpdateTimer.Tick += (_, _) => UpdateMeters();
         meterUpdateTimer.Start();
         showRawSessionsCheckBox.CheckedChanged += (_, _) => BindAppSessionsGrid();
@@ -231,6 +244,10 @@ public partial class MainForm : Form
                 appGroups = BuildAppGroups();
                 BindAppSessionsGrid();
                 UpdateChannelControlAvailability();
+                if (settings.AutoApplyRoutingRules)
+                {
+                    _ = AutoApplyPendingRoutesAsync();
+                }
             }
         };
         appSessionsGrid.DataError += (_, args) =>
@@ -581,7 +598,7 @@ public partial class MainForm : Form
         channelsContainer.RowStyles.Clear();
         channelsContainer.RowCount = 3;
         channelsContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
-        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 74F));
+        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
         channelsContainer.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
         unassignedAppsContainerPanel = new Panel
@@ -618,18 +635,13 @@ public partial class MainForm : Form
             BackColor = Color.FromArgb(24, 27, 33),
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = true,
-            AutoScroll = false,
+            AutoScroll = true,
             Padding = new Padding(4)
         };
 
         layout.Controls.Add(unassignedAppsTitleLabel, 0, 0);
         layout.Controls.Add(unassignedAppsFlowPanel, 1, 0);
         unassignedAppsContainerPanel.Controls.Add(layout);
-
-        RegisterUnassignedDropTarget(unassignedAppsContainerPanel);
-        RegisterUnassignedDropTarget(layout);
-        RegisterUnassignedDropTarget(unassignedAppsFlowPanel);
-        RegisterUnassignedDropTarget(unassignedAppsTitleLabel);
 
         channelsContainer.Controls.Add(unassignedAppsContainerPanel, 0, 1);
         channelsContainer.Controls.Add(channelsTable, 0, 2);
@@ -702,9 +714,29 @@ public partial class MainForm : Form
         stripControl.MonitorMuteButton.Click += (_, _) => ToggleChannelMute(controls);
         stripControl.StreamTrackBar.ValueChanged += (_, _) => HandleMixerStreamVolumeChanged(controls);
         stripControl.StreamMuteButton.Click += (_, _) => ToggleMixerStreamMute(controls);
-        RegisterChannelDropTarget(stripControl, channel.Name);
-
         return controls;
+    }
+
+    private void RegisterMixerDropTargets()
+    {
+        if (mixerDropTargetsRegistered)
+        {
+            return;
+        }
+
+        RegisterUnassignedDropTarget(unassignedAppsContainerPanel);
+        RegisterUnassignedDropTarget(unassignedAppsFlowPanel);
+        RegisterUnassignedDropTarget(unassignedAppsTitleLabel);
+        RegisterUnassignedDropTargetForChildren(unassignedAppsContainerPanel);
+
+        foreach (var controls in channelControlsByName.Values)
+        {
+            RegisterChannelDropTarget(controls.StripControl.AppDropArea, controls.Channel.Name);
+            RegisterChannelDropTarget(controls.StripControl.AppChipsPanel, controls.Channel.Name);
+            RegisterChannelDropTargetForChildren(controls.StripControl.AppChipsPanel, controls.Channel.Name);
+        }
+
+        mixerDropTargetsRegistered = true;
     }
 
     private void RegisterChannelDropTarget(Control target, string channelName)
@@ -722,9 +754,14 @@ public partial class MainForm : Form
             }
         };
 
-        foreach (Control child in target.Controls)
+    }
+
+    private void RegisterChannelDropTargetForChildren(Control control, string channelName)
+    {
+        foreach (Control child in control.Controls)
         {
             RegisterChannelDropTarget(child, channelName);
+            RegisterChannelDropTargetForChildren(child, channelName);
         }
     }
 
@@ -1885,6 +1922,11 @@ public partial class MainForm : Form
         BindAppSessionsGrid();
         UpdateChannelControlAvailability();
         SaveSettings();
+
+        if (settings.AutoApplyRoutingRules)
+        {
+            _ = AutoApplyPendingRoutesAsync();
+        }
     }
 
     private void SyncChannelFromEndpoint(ChannelControls controls, bool logErrors)
@@ -2025,6 +2067,7 @@ public partial class MainForm : Form
     {
         enableExperimentalRoutingCheckBox.Checked = settings.EnableExperimentalAutomaticRouting;
         autoApplyRoutingRulesCheckBox.Checked = settings.AutoApplyRoutingRules;
+        autoApplyRoutingTimer.Interval = (int)autoRefreshInterval.TotalMilliseconds;
         autoApplyRoutingTimer.Enabled = settings.AutoApplyRoutingRules;
     }
 
@@ -2106,36 +2149,210 @@ public partial class MainForm : Form
 
     private void RefreshAppSessions(bool logDetails = true)
     {
+        if (isRefreshingApps)
+        {
+            AppendLog("Refresh apps skipped: already running.");
+            return;
+        }
+
+        isRefreshingApps = true;
         try
         {
-            appSessions = audioSessionController.GetAudioSessions(endpoints);
-            AssignChannelsToSessions();
-            appGroups = BuildAppGroups();
-            BindAppSessionsGrid();
-            UpdateChannelControlAvailability();
-
             if (logDetails)
             {
-                AppendLog($"Found {appSessions.Count} active audio app session(s) across {appGroups.Count} app group(s).");
-                foreach (var group in appGroups)
-                {
-                    AppendLog(
-                        $"App group: {group.ProcessName}, PIDs = {FormatProcessIds(group.ProcessIds)}, sessions = {group.SessionCount}, endpoints = {group.CurrentEndpointsSummary}, target = {group.TargetEndpointFriendlyName}, volume = {group.VolumePercent}%, channel = {group.AssignedChannel}, status = {group.Status}");
-                }
+                AppendLog("Refresh apps started.");
             }
+
+            var refreshedSessions = audioSessionController.GetAudioSessions(endpoints);
+            ApplyRefreshedAppSessions(refreshedSessions, logDetails, bindGrid: true);
         }
         catch (Exception ex)
         {
-            appSessions = [];
-            appGroups = [];
-            BindAppSessionsGrid();
-            UpdateChannelControlAvailability();
-            AppendLog($"Audio session refresh error: {ex.Message}");
+            HandleAppRefreshError(ex, bindGrid: true);
         }
+        finally
+        {
+            isRefreshingApps = false;
+        }
+    }
+
+    private async Task<bool> RefreshAppSessionsAsync(
+        bool logDetails,
+        bool autoTriggered = false,
+        bool force = false,
+        bool bindGrid = false)
+    {
+        if (isRefreshingApps)
+        {
+            if (autoTriggered)
+            {
+                LogRoutingMessage("refresh-apps-skipped-running", "Refresh apps skipped: already running.", autoTriggered: true);
+            }
+            else
+            {
+                AppendLog("Refresh apps skipped: already running.");
+            }
+
+            return false;
+        }
+
+        var now = DateTime.UtcNow;
+        if (autoTriggered && !force && now - lastRefreshAppsUtc < autoRefreshInterval)
+        {
+            return false;
+        }
+
+        isRefreshingApps = true;
+        try
+        {
+            if (logDetails)
+            {
+                AppendLog("Refresh apps started.");
+            }
+
+            var endpointSnapshot = endpoints.ToList();
+            var refreshedSessions = await Task.Run(() => audioSessionController.GetAudioSessions(endpointSnapshot));
+            if (IsDisposed || Disposing)
+            {
+                return false;
+            }
+
+            ApplyRefreshedAppSessions(
+                refreshedSessions,
+                logDetails,
+                bindGrid || mainTabControl.SelectedTab == routingTabPage);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (!IsDisposed && !Disposing)
+            {
+                HandleAppRefreshError(ex, bindGrid || mainTabControl.SelectedTab == routingTabPage);
+            }
+
+            return false;
+        }
+        finally
+        {
+            isRefreshingApps = false;
+        }
+    }
+
+    private void ApplyRefreshedAppSessions(
+        IReadOnlyList<AudioAppSession> refreshedSessions,
+        bool logDetails,
+        bool bindGrid)
+    {
+        var oldGroups = appGroups;
+        appSessions = refreshedSessions;
+        AssignChannelsToSessions();
+        var refreshedGroups = BuildAppGroups();
+        var changeCount = CountAppGroupChanges(oldGroups, refreshedGroups);
+        appGroups = refreshedGroups;
+
+        if (bindGrid)
+        {
+            BindAppSessionsGrid();
+        }
+
+        UpdateChannelControlAvailability();
+        lastRefreshAppsUtc = DateTime.UtcNow;
+
+        if (logDetails || changeCount > 0)
+        {
+            AppendLog($"Refresh apps completed: {appGroups.Count} groups, {changeCount} changes.");
+        }
+
+        if (logDetails)
+        {
+            AppendLog($"Found {appSessions.Count} active audio app session(s) across {appGroups.Count} app group(s).");
+            foreach (var group in appGroups)
+            {
+                AppendLog(
+                    $"App group: {group.ProcessName}, PIDs = {FormatProcessIds(group.ProcessIds)}, sessions = {group.SessionCount}, endpoints = {group.CurrentEndpointsSummary}, target = {group.TargetEndpointFriendlyName}, volume = {group.VolumePercent}%, channel = {group.AssignedChannel}, status = {group.Status}");
+            }
+        }
+    }
+
+    private void HandleAppRefreshError(Exception ex, bool bindGrid)
+    {
+        appSessions = [];
+        appGroups = [];
+        if (bindGrid)
+        {
+            BindAppSessionsGrid();
+        }
+
+        UpdateChannelControlAvailability();
+        AppendLog($"Audio session refresh error: {ex.Message}");
+    }
+
+    private static int CountAppGroupChanges(
+        IReadOnlyList<AudioAppGroup> oldGroups,
+        IReadOnlyList<AudioAppGroup> newGroups)
+    {
+        var oldSignatures = oldGroups.ToDictionary(
+            group => group.ProcessName,
+            GetAppGroupSignature,
+            StringComparer.OrdinalIgnoreCase);
+        var newSignatures = newGroups.ToDictionary(
+            group => group.ProcessName,
+            GetAppGroupSignature,
+            StringComparer.OrdinalIgnoreCase);
+
+        var changes = newSignatures.Count(group =>
+            !oldSignatures.TryGetValue(group.Key, out var oldSignature) ||
+            !oldSignature.Equals(group.Value, StringComparison.Ordinal));
+        changes += oldSignatures.Keys.Count(processName => !newSignatures.ContainsKey(processName));
+        return changes;
+    }
+
+    private static string GetAppGroupSignature(AudioAppGroup group)
+    {
+        return string.Join(
+            "|",
+            group.AssignedChannel,
+            group.TargetEndpointId ?? string.Empty,
+            group.Status,
+            group.SessionCount.ToString(CultureInfo.InvariantCulture),
+            FormatProcessIds(group.ProcessIds),
+            group.CurrentEndpointsSummary);
+    }
+
+    private async Task HandleAutoApplyTimerTickAsync()
+    {
+        if (!settings.AutoApplyRoutingRules)
+        {
+            return;
+        }
+
+        var refreshed = await RefreshAppSessionsAsync(
+            logDetails: false,
+            autoTriggered: true,
+            force: false,
+            bindGrid: false);
+        if (!refreshed)
+        {
+            return;
+        }
+
+        await AutoApplyPendingRoutesAsync();
     }
 
     private void ApplyRouting(bool autoTriggered)
     {
+        if (isApplyingRouting)
+        {
+            LogRoutingMessage(
+                autoTriggered ? "auto-apply-skipped-running" : "manual-apply-skipped-running",
+                autoTriggered ? "Auto apply skipped: routing already running." : "Apply Routing skipped: routing already running.",
+                autoTriggered);
+            return;
+        }
+
+        isApplyingRouting = true;
+        try
+        {
         if (autoTriggered)
         {
             RefreshAppSessions(logDetails: false);
@@ -2164,6 +2381,11 @@ public partial class MainForm : Form
         RefreshAppSessions(logDetails: !autoTriggered);
         ApplyPostRoutingStatuses(successfulRoutes);
         LogPostApplyRoutingState(autoTriggered, successfulRoutes);
+        }
+        finally
+        {
+            isApplyingRouting = false;
+        }
     }
 
     private bool ApplyRoutingToGroup(
@@ -2726,12 +2948,21 @@ public partial class MainForm : Form
                 .Where(group => group.AssignedChannel.Equals(controls.Channel.Name, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
-            var visibleGroups = assignedGroups.Take(2).ToList();
+            var signature = BuildAppChipSignature(assignedGroups);
+            if (channelAppChipSignatures.TryGetValue(controls.Channel.Name, out var previousSignature) &&
+                previousSignature.Equals(signature, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            channelAppChipSignatures[controls.Channel.Name] = signature;
+            var visibleGroups = assignedGroups.Take(4).ToList();
             var chips = visibleGroups
                 .Select(group => CreateAppChip(group, controls.Channel.Name))
                 .Cast<Control>()
                 .ToList();
             controls.StripControl.SetAppChips(chips, assignedGroups.Count - visibleGroups.Count);
+            RegisterChannelDropTargetForChildren(controls.StripControl.AppChipsPanel, controls.Channel.Name);
         }
 
         UpdateUnassignedAppChips();
@@ -2744,6 +2975,18 @@ public partial class MainForm : Form
             return;
         }
 
+        var unassignedGroups = appGroups
+            .Where(group => group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+            .Where(group => !ShouldHideFromUnassignedMixer(group))
+            .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var signature = BuildAppChipSignature(unassignedGroups);
+        if (unassignedAppChipSignature.Equals(signature, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        unassignedAppChipSignature = signature;
         unassignedAppsFlowPanel.SuspendLayout();
         var oldControls = unassignedAppsFlowPanel.Controls.Cast<Control>().ToList();
         unassignedAppsFlowPanel.Controls.Clear();
@@ -2751,12 +2994,6 @@ public partial class MainForm : Form
         {
             control.Dispose();
         }
-
-        var unassignedGroups = appGroups
-            .Where(group => group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
-            .Where(group => !ShouldHideFromUnassignedMixer(group))
-            .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
-            .ToList();
 
         if (unassignedGroups.Count == 0)
         {
@@ -2783,12 +3020,21 @@ public partial class MainForm : Form
             RegisterUnassignedDropTarget(chip);
             RegisterUnassignedDropTargetForChildren(chip);
         }
-        else
-        {
-            RegisterChannelDropTarget(chip, channelDropTarget);
-        }
 
         return chip;
+    }
+
+    private static string BuildAppChipSignature(IEnumerable<AudioAppGroup> groups)
+    {
+        return string.Join(
+            "||",
+            groups.Select(group => string.Join(
+                "|",
+                group.ProcessName,
+                group.AssignedChannel,
+                group.TargetEndpointId ?? string.Empty,
+                group.CurrentEndpointsSummary,
+                GetAppChipStatus(group).ToString())));
     }
 
     private void RegisterUnassignedDropTargetForChildren(Control control)
@@ -2886,48 +3132,145 @@ public partial class MainForm : Form
             !channelName.Equals("None", StringComparison.OrdinalIgnoreCase) &&
             settings.AutoApplyRoutingRules)
         {
-            ApplyRoutingForProcessFromMixer(normalizedProcessName);
+            _ = AutoApplyPendingRoutesAsync(normalizedProcessName);
         }
     }
 
-    private void ApplyRoutingForProcessFromMixer(string normalizedProcessName)
+    private async Task AutoApplyPendingRoutesAsync(string? onlyProcessName = null)
     {
-        var successfulRoutes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var processed = false;
-
-        foreach (DataGridViewRow row in appSessionsGrid.Rows)
+        if (isApplyingRouting)
         {
-            var rowProcessName = row.Tag switch
-            {
-                AudioAppGroup group => group.ProcessName,
-                AudioAppSession session => session.ProcessName,
-                _ => string.Empty
-            };
+            LogRoutingMessage("auto-apply-skipped-running", "Auto apply skipped: routing already running.", autoTriggered: true);
+            return;
+        }
 
-            if (!NormalizeProcessName(rowProcessName).Equals(normalizedProcessName, StringComparison.OrdinalIgnoreCase))
+        var requests = BuildAutoRoutingRequests(onlyProcessName);
+        if (requests.Count == 0)
+        {
+            return;
+        }
+
+        isApplyingRouting = true;
+        try
+        {
+            var outcomes = await Task.Run(() =>
+                requests
+                    .Select(request => new AutoRoutingOutcome(
+                        request,
+                        request.ProcessIds
+                            .Select(processId => audioPolicyRouter.TrySetAppOutputDevice(
+                                (uint)processId,
+                                request.ProcessName,
+                                request.TargetEndpointId,
+                                request.TargetEndpointFriendlyName))
+                            .ToList()))
+                    .ToList());
+
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
+
+            foreach (var outcome in outcomes)
+            {
+                var routeKey = GetRouteKey(outcome.Request.ProcessName, outcome.Request.TargetEndpointId);
+                var success = outcome.Results.Any(result => result.Success);
+                var status = success
+                    ? "Routed preference saved"
+                    : outcome.Results.LastOrDefault()?.Status ?? "Error";
+                lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(DateTime.UtcNow, status);
+
+                foreach (var result in outcome.Results)
+                {
+                    LogRoutingResult(result, autoTriggered: true);
+                }
+
+                var group = appGroups.FirstOrDefault(group =>
+                    group.ProcessName.Equals(outcome.Request.ProcessName, StringComparison.OrdinalIgnoreCase));
+                if (group is not null)
+                {
+                    group.Status = status;
+                }
+
+                AppendLog(success
+                    ? $"Auto apply routed {outcome.Request.ProcessName} -> {outcome.Request.AssignedChannel}"
+                    : $"Auto apply {outcome.Request.ProcessName} -> {outcome.Request.AssignedChannel}: {status}");
+            }
+
+            if (mainTabControl.SelectedTab == routingTabPage)
+            {
+                BindAppSessionsGrid();
+            }
+
+            UpdateMixerAppSummaries();
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Auto apply error: {ex.Message}");
+        }
+        finally
+        {
+            isApplyingRouting = false;
+        }
+    }
+
+    private List<AutoRoutingRequest> BuildAutoRoutingRequests(string? onlyProcessName)
+    {
+        var now = DateTime.UtcNow;
+        var requests = new List<AutoRoutingRequest>();
+        foreach (var group in appGroups)
+        {
+            if (!string.IsNullOrWhiteSpace(onlyProcessName) &&
+                !NormalizeProcessName(group.ProcessName).Equals(
+                    NormalizeProcessName(onlyProcessName),
+                    StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
 
-            processed |= row.Tag switch
+            if (group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(group.TargetEndpointId) ||
+                group.ProcessIds.Count == 0)
             {
-                AudioAppGroup group => ApplyRoutingToGroup(row, group, successfulRoutes, autoTriggered: false),
-                AudioAppSession session => ApplyRoutingToSession(row, session, successfulRoutes, autoTriggered: false),
-                _ => false
-            };
+                continue;
+            }
+
+            var routeKey = GetRouteKey(group.ProcessName, group.TargetEndpointId);
+            if (group.AreAllSessionsOnTarget())
+            {
+                LogRoutingMessage(
+                    $"auto-apply-already-routed:{routeKey}",
+                    $"Auto apply skipped: already routed {group.ProcessName}.",
+                    autoTriggered: true);
+                continue;
+            }
+
+            if (!settings.EnableExperimentalAutomaticRouting)
+            {
+                LogManualRoutingRequired(group.ProcessName, group.TargetEndpointFriendlyName, autoTriggered: true);
+                continue;
+            }
+
+            if (lastAutoRoutingAttempts.TryGetValue(routeKey, out var lastAttempt) &&
+                now - lastAttempt.Utc < autoRoutingCooldown)
+            {
+                LogRoutingMessage(
+                    $"auto-apply-recent:{routeKey}",
+                    $"Auto apply skipped: recently applied {group.ProcessName}.",
+                    autoTriggered: true);
+                continue;
+            }
+
+            lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(now, "Started");
+            requests.Add(new AutoRoutingRequest(
+                group.ProcessName,
+                group.AssignedChannel,
+                group.TargetEndpointId,
+                group.TargetEndpointFriendlyName,
+                group.ProcessIds.ToList()));
         }
 
-        if (!processed)
-        {
-            AppendLog($"{normalizedProcessName} auto apply skipped: active app group not found.");
-            return;
-        }
-
-        SaveSettings();
-        RefreshAppSessions(logDetails: false);
-        ApplyPostRoutingStatuses(successfulRoutes);
-        LogPostApplyRoutingState(autoTriggered: false, successfulRoutes);
-        UpdateMixerAppSummaries();
+        return requests;
     }
 
     private void StoreRoutingRuleMap(IDictionary<string, AppRoutingRule> rules)
@@ -3349,6 +3692,19 @@ public partial class MainForm : Form
 
         public bool IsUpdating { get; set; }
     }
+
+    private sealed record AutoRoutingAttempt(DateTime Utc, string Status);
+
+    private sealed record AutoRoutingRequest(
+        string ProcessName,
+        string AssignedChannel,
+        string TargetEndpointId,
+        string TargetEndpointFriendlyName,
+        IReadOnlyList<int> ProcessIds);
+
+    private sealed record AutoRoutingOutcome(
+        AutoRoutingRequest Request,
+        IReadOnlyList<AppOutputRoutingResult> Results);
 
     private sealed class EndpointChoice
     {

@@ -42,7 +42,7 @@ public sealed class DualMixChannelStripControl : UserControl
 
         Dock = DockStyle.Fill;
         Margin = new Padding(6);
-        MinimumSize = new Size(168, 452);
+        MinimumSize = new Size(168, 488);
         BackColor = SurfaceColor;
         Padding = new Padding(1);
 
@@ -60,7 +60,7 @@ public sealed class DualMixChannelStripControl : UserControl
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 31F));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 100F));
 
         iconLabel.Dock = DockStyle.Fill;
         iconLabel.Font = new Font("Segoe UI", 8.5F, FontStyle.Bold);
@@ -95,7 +95,7 @@ public sealed class DualMixChannelStripControl : UserControl
 
         appAreaPanel.Dock = DockStyle.Fill;
         appAreaPanel.BackColor = InnerColor;
-        appAreaPanel.Padding = new Padding(4);
+        appAreaPanel.Padding = new Padding(5);
 
         appSummaryLabel.Dock = DockStyle.Fill;
         appSummaryLabel.BackColor = InnerColor;
@@ -110,7 +110,7 @@ public sealed class DualMixChannelStripControl : UserControl
         appChipsPanel.BackColor = InnerColor;
         appChipsPanel.FlowDirection = FlowDirection.TopDown;
         appChipsPanel.WrapContents = false;
-        appChipsPanel.AutoScroll = false;
+        appChipsPanel.AutoScroll = true;
         appChipsPanel.Visible = false;
 
         appAreaPanel.Controls.Add(appChipsPanel);
@@ -146,6 +146,8 @@ public sealed class DualMixChannelStripControl : UserControl
     public ComboBox EndpointComboBox => endpointComboBox;
 
     public FlowLayoutPanel AppChipsPanel => appChipsPanel;
+
+    public Control AppDropArea => appAreaPanel;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string ChannelName
@@ -323,7 +325,7 @@ public sealed class DualMixChannelStripControl : UserControl
             Height = 24,
             ForeColor = SecondaryTextColor,
             Font = new Font("Segoe UI", 8.5F),
-            Text = "No apps",
+            Text = "Drop apps here",
             TextAlign = ContentAlignment.MiddleCenter
         };
     }
@@ -333,7 +335,7 @@ public sealed class DualMixChannelStripControl : UserControl
         return new Label
         {
             AutoSize = false,
-            Height = 22,
+            Height = 20,
             Width = 120,
             Margin = new Padding(2),
             ForeColor = SecondaryTextColor,

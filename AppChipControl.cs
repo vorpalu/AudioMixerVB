@@ -32,11 +32,11 @@ public sealed class AppChipControl : UserControl
 
         ProcessName = processName;
         Status = status;
-        Height = 24;
+        Height = 22;
         Width = CalculateWidth(processName);
-        MinimumSize = new Size(86, 24);
-        MaximumSize = new Size(162, 24);
-        Margin = new Padding(2);
+        MinimumSize = new Size(82, 22);
+        MaximumSize = new Size(156, 22);
+        Margin = new Padding(2, 1, 2, 1);
         BackColor = ChipColor;
         Cursor = Cursors.SizeAll;
         AccessibleName = $"App chip {processName}";
@@ -50,7 +50,7 @@ public sealed class AppChipControl : UserControl
         nameLabel.Dock = DockStyle.Fill;
         nameLabel.AutoEllipsis = true;
         nameLabel.Text = processName;
-        nameLabel.Font = new Font("Segoe UI", 8F, FontStyle.Bold);
+        nameLabel.Font = new Font("Segoe UI", 7.8F, FontStyle.Bold);
         nameLabel.ForeColor = TextColor;
         nameLabel.TextAlign = ContentAlignment.MiddleLeft;
         nameLabel.Padding = new Padding(6, 0, 4, 1);
@@ -141,8 +141,8 @@ public sealed class AppChipControl : UserControl
 
     private static int CalculateWidth(string processName)
     {
-        var textWidth = TextRenderer.MeasureText(processName, new Font("Segoe UI", 8F, FontStyle.Bold)).Width;
-        return Math.Clamp(textWidth + 30, 86, 162);
+        var textWidth = TextRenderer.MeasureText(processName, new Font("Segoe UI", 7.8F, FontStyle.Bold)).Width;
+        return Math.Clamp(textWidth + 30, 82, 156);
     }
 
     private static Color GetStatusColor(AppChipStatus status)
