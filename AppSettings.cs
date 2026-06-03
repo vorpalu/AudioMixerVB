@@ -12,6 +12,8 @@ public sealed class AppSettings
 
     public MonitorMixSettings MonitorMix { get; set; } = new();
 
+    public StreamMixSettings StreamMix { get; set; } = new();
+
     public bool EnableExperimentalAutomaticRouting { get; set; }
 
     public bool AutoApplyRoutingRules { get; set; }
@@ -82,6 +84,33 @@ public sealed class AppSettings
             if (!MonitorMix.ChannelMutes.ContainsKey(channelName))
             {
                 MonitorMix.ChannelMutes[channelName] = false;
+            }
+        }
+
+        StreamMix ??= new StreamMixSettings();
+        StreamMix.ChannelGains = new Dictionary<string, float>(
+            StreamMix.ChannelGains ?? [],
+            StringComparer.OrdinalIgnoreCase);
+        StreamMix.ChannelMutes = new Dictionary<string, bool>(
+            StreamMix.ChannelMutes ?? [],
+            StringComparer.OrdinalIgnoreCase);
+        StreamMix.MasterGain = Math.Clamp(StreamMix.MasterGain, 0f, 1f);
+        StreamMix.LatencyMs = Math.Clamp(StreamMix.LatencyMs, 20, 500);
+
+        foreach (var channelName in MixerChannel.DefaultChannelNames)
+        {
+            if (!StreamMix.ChannelGains.ContainsKey(channelName))
+            {
+                StreamMix.ChannelGains[channelName] = 1.0f;
+            }
+            else
+            {
+                StreamMix.ChannelGains[channelName] = Math.Clamp(StreamMix.ChannelGains[channelName], 0f, 1f);
+            }
+
+            if (!StreamMix.ChannelMutes.ContainsKey(channelName))
+            {
+                StreamMix.ChannelMutes[channelName] = false;
             }
         }
 

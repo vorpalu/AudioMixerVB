@@ -11,6 +11,7 @@ partial class MainForm
     private TabPage mixerTabPage = null!;
     private TabPage routingTabPage = null!;
     private TabPage monitorTabPage = null!;
+    private TabPage streamTabPage = null!;
     private TabPage logsTabPage = null!;
     private TabPage settingsTabPage = null!;
     private TableLayoutPanel channelsContainer = null!;
@@ -64,6 +65,7 @@ partial class MainForm
         mixerTabPage = new TabPage();
         routingTabPage = new TabPage();
         monitorTabPage = new TabPage();
+        streamTabPage = new TabPage();
         logsTabPage = new TabPage();
         settingsTabPage = new TabPage();
         channelsContainer = new TableLayoutPanel();
@@ -103,6 +105,7 @@ partial class MainForm
         channelsContainer.SuspendLayout();
         endpointToolbarPanel.SuspendLayout();
         routingTabPage.SuspendLayout();
+        streamTabPage.SuspendLayout();
         appRoutingGroupBox.SuspendLayout();
         appRoutingLayout.SuspendLayout();
         appRoutingToolbarPanel.SuspendLayout();
@@ -146,6 +149,7 @@ partial class MainForm
         mainTabControl.Controls.Add(mixerTabPage);
         mainTabControl.Controls.Add(routingTabPage);
         mainTabControl.Controls.Add(monitorTabPage);
+        mainTabControl.Controls.Add(streamTabPage);
         mainTabControl.Controls.Add(logsTabPage);
         mainTabControl.Controls.Add(settingsTabPage);
         mainTabControl.Dock = DockStyle.Fill;
@@ -187,6 +191,16 @@ partial class MainForm
         monitorTabPage.Text = "Monitor";
         monitorTabPage.UseVisualStyleBackColor = true;
         // 
+        // streamTabPage
+        // 
+        streamTabPage.Location = new Point(4, 29);
+        streamTabPage.Name = "streamTabPage";
+        streamTabPage.Padding = new Padding(8);
+        streamTabPage.Size = new Size(1146, 646);
+        streamTabPage.TabIndex = 3;
+        streamTabPage.Text = "Stream";
+        streamTabPage.UseVisualStyleBackColor = true;
+        // 
         // logsTabPage
         // 
         logsTabPage.Controls.Add(logGroupBox);
@@ -194,7 +208,7 @@ partial class MainForm
         logsTabPage.Name = "logsTabPage";
         logsTabPage.Padding = new Padding(8);
         logsTabPage.Size = new Size(1146, 646);
-        logsTabPage.TabIndex = 3;
+        logsTabPage.TabIndex = 4;
         logsTabPage.Text = "Logs";
         logsTabPage.UseVisualStyleBackColor = true;
         // 
@@ -205,7 +219,7 @@ partial class MainForm
         settingsTabPage.Name = "settingsTabPage";
         settingsTabPage.Padding = new Padding(8);
         settingsTabPage.Size = new Size(1146, 646);
-        settingsTabPage.TabIndex = 4;
+        settingsTabPage.TabIndex = 5;
         settingsTabPage.Text = "Settings";
         settingsTabPage.UseVisualStyleBackColor = true;
         // 
@@ -581,6 +595,7 @@ partial class MainForm
         endpointToolbarPanel.ResumeLayout(false);
         endpointToolbarPanel.PerformLayout();
         routingTabPage.ResumeLayout(false);
+        streamTabPage.ResumeLayout(false);
         appRoutingGroupBox.ResumeLayout(false);
         appRoutingLayout.ResumeLayout(false);
         appRoutingToolbarPanel.ResumeLayout(false);
