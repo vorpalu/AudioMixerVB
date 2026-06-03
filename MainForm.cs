@@ -15,7 +15,6 @@ public partial class MainForm : Form
     private readonly SettingsService settingsService = new();
     private readonly SerialController serialController = new();
     private readonly Dictionary<string, ChannelControls> channelControlsByName = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, StreamChannelControls> streamChannelControlsByName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> lastAutoRoutingMessages = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<MixerChannel> channels;
 
@@ -48,7 +47,6 @@ public partial class MainForm : Form
     private Label monitorWarningLabel = null!;
     private GroupBox streamMixGroupBox = null!;
     private TableLayoutPanel streamMixLayout = null!;
-    private TableLayoutPanel streamChannelsTable = null!;
     private ComboBox streamOutputComboBox = null!;
     private Button startStreamButton = null!;
     private Button stopStreamButton = null!;
@@ -57,7 +55,6 @@ public partial class MainForm : Form
     private Label streamLatencyValueLabel = null!;
     private NumericUpDown streamLatencyNumericUpDown = null!;
     private Label streamWarningLabel = null!;
-    private ChannelStripControl streamMasterStripControl = null!;
     private DualMixChannelStripControl masterStripControl = null!;
     private Button clearLogButton = null!;
     private Button copyLogButton = null!;
@@ -186,8 +183,6 @@ public partial class MainForm : Form
         restartMonitorButton.Click += async (_, _) => await RestartMonitorAsync();
         streamOutputComboBox.SelectedIndexChanged += (_, _) => HandleStreamOutputChanged();
         streamLatencyNumericUpDown.ValueChanged += (_, _) => HandleStreamLatencyChanged();
-        streamMasterStripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleStreamMasterGainChanged();
-        streamMasterStripControl.MuteButton.Click += (_, _) => ToggleStreamMasterMute();
         startStreamButton.Click += (_, _) => StartStreamMix();
         stopStreamButton.Click += async (_, _) => await StopStreamMixAsync();
         restartStreamButton.Click += async (_, _) => await RestartStreamMixAsync();
@@ -337,11 +332,10 @@ public partial class MainForm : Form
         {
             ColumnCount = 1,
             Dock = DockStyle.Fill,
-            RowCount = 3
+            RowCount = 2
         };
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 124F));
-        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54F));
         rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
         streamMixLayout = new TableLayoutPanel
@@ -391,39 +385,6 @@ public partial class MainForm : Form
 
         rootLayout.Controls.Add(streamMixLayout, 0, 0);
         rootLayout.Controls.Add(streamWarningLabel, 0, 1);
-
-        streamChannelsTable = new TableLayoutPanel
-        {
-            ColumnCount = StreamChannelNames.Length + 1,
-            Dock = DockStyle.Fill,
-            RowCount = 1
-        };
-        streamChannelsTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-        for (var column = 0; column < streamChannelsTable.ColumnCount; column++)
-        {
-            streamChannelsTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F / streamChannelsTable.ColumnCount));
-        }
-
-        streamMasterStripControl = new ChannelStripControl
-        {
-            ChannelName = "Stream Master",
-            AccentColor = Color.FromArgb(86, 169, 255),
-            EndpointComboBoxVisible = false,
-            VolumePercent = GainToPercent(settings.StreamMix.MasterGain),
-            IsMuted = settings.StreamMix.MasterMuted
-        };
-        streamMasterStripControl.SetEndpointControlsEnabled(enabled: true);
-        streamMasterStripControl.SetStatus("No output", Color.FromArgb(190, 196, 205));
-        streamChannelsTable.Controls.Add(streamMasterStripControl, 0, 0);
-
-        for (var index = 0; index < StreamChannelNames.Length; index++)
-        {
-            var controls = CreateStreamChannelControls(StreamChannelNames[index]);
-            streamChannelControlsByName[controls.ChannelName] = controls;
-            streamChannelsTable.Controls.Add(controls.StripControl, index + 1, 0);
-        }
-
-        rootLayout.Controls.Add(streamChannelsTable, 0, 2);
         streamMixGroupBox.Controls.Add(rootLayout);
         streamTabPage.Controls.Add(streamMixGroupBox);
         streamTabPage.ResumeLayout();
@@ -451,26 +412,6 @@ public partial class MainForm : Form
             TextAlign = ContentAlignment.MiddleLeft
         }, 4, row);
         streamMixLayout.Controls.Add(rightControl, 5, row);
-    }
-
-    private StreamChannelControls CreateStreamChannelControls(string channelName)
-    {
-        var stripControl = new ChannelStripControl
-        {
-            ChannelName = channelName,
-            AccentColor = GetChannelAccentColor(channelName),
-            EndpointComboBoxVisible = false,
-            VolumePercent = GainToPercent(settings.StreamMix.ChannelGains.GetValueOrDefault(channelName, 1.0f)),
-            IsMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(channelName)
-        };
-        stripControl.SetEndpointControlsEnabled(enabled: true);
-        stripControl.SetStatus("No input", Color.FromArgb(190, 196, 205));
-
-        var controls = new StreamChannelControls(channelName, stripControl);
-        stripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleStreamChannelGainChanged(controls);
-        stripControl.MuteButton.Click += (_, _) => ToggleStreamChannelMute(controls);
-
-        return controls;
     }
 
     private static ComboBox CreateMonitorComboBox()
@@ -633,6 +574,7 @@ public partial class MainForm : Form
     {
         channelsTable.SuspendLayout();
         channelsTable.Controls.Clear();
+        channelControlsByName.Clear();
         channelsTable.ColumnStyles.Clear();
         channelsTable.RowStyles.Clear();
         channelsTable.ColumnCount = channels.Count + 1;
@@ -652,7 +594,8 @@ public partial class MainForm : Form
             MonitorPercent = GainToPercent(settings.MonitorMix.MasterGain),
             StreamPercent = GainToPercent(settings.StreamMix.MasterGain),
             MonitorMuted = settings.MonitorMix.MasterMuted,
-            StreamMuted = settings.StreamMix.MasterMuted
+            StreamMuted = settings.StreamMix.MasterMuted,
+            EndpointComboBoxVisible = false
         };
         masterStripControl.SetMixControlsEnabled(enabled: true);
         channelsTable.Controls.Add(masterStripControl, 0, 0);
@@ -681,12 +624,14 @@ public partial class MainForm : Form
             MonitorPercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(channel.Name, 0.5f)),
             StreamPercent = GainToPercent(settings.StreamMix.ChannelGains.GetValueOrDefault(channel.Name, 1.0f)),
             MonitorMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(channel.Name),
-            StreamMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(channel.Name)
+            StreamMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(channel.Name),
+            EndpointComboBoxVisible = true
         };
         stripControl.SetMixControlsEnabled(enabled: true);
 
         var controls = new ChannelControls(channel, stripControl);
 
+        stripControl.EndpointComboBox.SelectedIndexChanged += (_, _) => HandleEndpointSelectionChanged(controls);
         stripControl.MonitorTrackBar.ValueChanged += (_, _) => HandleVolumeChanged(controls);
         stripControl.MonitorMuteButton.Click += (_, _) => ToggleChannelMute(controls);
         stripControl.StreamTrackBar.ValueChanged += (_, _) => HandleMixerStreamVolumeChanged(controls);
@@ -747,16 +692,6 @@ public partial class MainForm : Form
                 ? PeakToPercent(peak)
                 : 0;
             controls.StripControl.StreamVuMeter.Value = PeakToPercent(streamMixEngine.GetChannelPeak(controls.Channel.Name));
-        }
-
-        if (streamMasterStripControl is not null)
-        {
-            streamMasterStripControl.VuMeter.Value = PeakToPercent(streamMixEngine.GetMasterPeak());
-        }
-
-        foreach (var controls in streamChannelControlsByName.Values)
-        {
-            controls.StripControl.VuMeter.Value = PeakToPercent(streamMixEngine.GetChannelPeak(controls.ChannelName));
         }
     }
 
@@ -906,7 +841,22 @@ public partial class MainForm : Form
         foreach (var controls in channelControlsByName.Values)
         {
             controls.IsUpdating = true;
+            var comboBox = controls.StripControl.EndpointComboBox;
+            comboBox.BeginUpdate();
+            comboBox.Items.Clear();
+            comboBox.Items.Add(EndpointChoice.Empty);
+
+            foreach (var endpoint in endpoints)
+            {
+                comboBox.Items.Add(new EndpointChoice(endpoint));
+            }
+
             var selectedEndpoint = FindSelectedEndpoint(controls.Channel);
+            comboBox.SelectedItem = selectedEndpoint is null
+                ? EndpointChoice.Empty
+                : FindChoice(comboBox, selectedEndpoint.Id) ?? EndpointChoice.Empty;
+            comboBox.DropDownWidth = Math.Max(comboBox.DropDownWidth, 360);
+            comboBox.EndUpdate();
             controls.IsUpdating = false;
 
             if (selectedEndpoint is null)
@@ -1048,19 +998,8 @@ public partial class MainForm : Form
         PopulateStreamOutputComboBox();
         streamLatencyNumericUpDown.Value = Math.Clamp(settings.StreamMix.LatencyMs, 20, 500);
         streamLatencyValueLabel.Text = $"{settings.StreamMix.LatencyMs} ms";
-        streamMasterStripControl.VolumePercent = GainToPercent(settings.StreamMix.MasterGain);
-        streamMasterStripControl.IsMuted = settings.StreamMix.MasterMuted;
         masterStripControl.StreamPercent = GainToPercent(settings.StreamMix.MasterGain);
         masterStripControl.StreamMuted = settings.StreamMix.MasterMuted;
-
-        foreach (var controls in streamChannelControlsByName.Values)
-        {
-            controls.IsUpdating = true;
-            controls.StripControl.VolumePercent = GainToPercent(
-                settings.StreamMix.ChannelGains.GetValueOrDefault(controls.ChannelName, 1.0f));
-            controls.StripControl.IsMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.ChannelName);
-            controls.IsUpdating = false;
-        }
 
         foreach (var controls in channelControlsByName.Values)
         {
@@ -1076,7 +1015,6 @@ public partial class MainForm : Form
         ApplyStreamSettingsToEngine();
         UpdateStreamWarning();
         UpdateStreamMasterStripSummary();
-        UpdateStreamCaptureDisplays();
     }
 
     private void PopulateStreamOutputComboBox()
@@ -1414,36 +1352,14 @@ public partial class MainForm : Form
         }
     }
 
-    private void HandleStreamMasterGainChanged()
-    {
-        if (updatingStreamUi)
-        {
-            return;
-        }
-
-        var volumePercent = streamMasterStripControl.VolumeTrackBar.Value;
-        ApplyStreamMasterGain(volumePercent);
-    }
-
     private void ApplyStreamMasterGain(int volumePercent)
     {
         volumePercent = Math.Clamp(volumePercent, 0, 100);
         settings.StreamMix.MasterGain = volumePercent / 100f;
-        SetStreamMasterVolumeUiValue(volumePercent);
         SetMixerStreamMasterVolumeUiValue(volumePercent);
         streamMixEngine.SetMasterGain(settings.StreamMix.MasterGain);
         SaveSettings();
         AppendLog($"Stream master gain = {volumePercent}%");
-    }
-
-    private void ToggleStreamMasterMute()
-    {
-        settings.StreamMix.MasterMuted = !settings.StreamMix.MasterMuted;
-        streamMixEngine.SetMasterMute(settings.StreamMix.MasterMuted);
-        SetStreamMasterMuteUiValue(settings.StreamMix.MasterMuted);
-        SetMixerStreamMasterMuteUiValue(settings.StreamMix.MasterMuted);
-        SaveSettings();
-        AppendLog($"Stream master mute = {(settings.StreamMix.MasterMuted ? "on" : "off")}");
     }
 
     private void HandleMixerStreamMasterGainChanged()
@@ -1461,20 +1377,9 @@ public partial class MainForm : Form
     {
         settings.StreamMix.MasterMuted = !settings.StreamMix.MasterMuted;
         streamMixEngine.SetMasterMute(settings.StreamMix.MasterMuted);
-        SetStreamMasterMuteUiValue(settings.StreamMix.MasterMuted);
         SetMixerStreamMasterMuteUiValue(settings.StreamMix.MasterMuted);
         SaveSettings();
         AppendLog($"Stream master mute = {(settings.StreamMix.MasterMuted ? "on" : "off")}");
-    }
-
-    private void HandleStreamChannelGainChanged(StreamChannelControls controls)
-    {
-        if (updatingStreamUi || controls.IsUpdating)
-        {
-            return;
-        }
-
-        ApplyStreamChannelGain(controls.ChannelName, controls.StripControl.VolumeTrackBar.Value);
     }
 
     private void HandleMixerStreamVolumeChanged(ChannelControls controls)
@@ -1492,22 +1397,10 @@ public partial class MainForm : Form
         volumePercent = Math.Clamp(volumePercent, 0, 100);
         var gain = volumePercent / 100f;
         settings.StreamMix.ChannelGains[channelName] = gain;
-        SetStreamChannelVolumeUiValue(channelName, volumePercent);
         SetMixerStreamChannelVolumeUiValue(channelName, volumePercent);
         streamMixEngine.SetChannelGain(channelName, gain);
         SaveSettings();
         AppendLog($"{channelName} stream gain = {volumePercent}%");
-    }
-
-    private void ToggleStreamChannelMute(StreamChannelControls controls)
-    {
-        var isMuted = !settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.ChannelName);
-        settings.StreamMix.ChannelMutes[controls.ChannelName] = isMuted;
-        streamMixEngine.SetChannelMute(controls.ChannelName, isMuted);
-        SetStreamChannelMuteUiValue(controls.ChannelName, isMuted);
-        SetMixerStreamChannelMuteUiValue(controls.ChannelName, isMuted);
-        SaveSettings();
-        AppendLog($"{controls.ChannelName} stream mute = {(isMuted ? "on" : "off")}");
     }
 
     private void ToggleMixerStreamMute(ChannelControls controls)
@@ -1515,7 +1408,6 @@ public partial class MainForm : Form
         var isMuted = !settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
         settings.StreamMix.ChannelMutes[controls.Channel.Name] = isMuted;
         streamMixEngine.SetChannelMute(controls.Channel.Name, isMuted);
-        SetStreamChannelMuteUiValue(controls.Channel.Name, isMuted);
         SetMixerStreamChannelMuteUiValue(controls.Channel.Name, isMuted);
         SaveSettings();
         AppendLog($"{controls.Channel.Name} stream mute = {(isMuted ? "on" : "off")}");
@@ -1709,28 +1601,7 @@ public partial class MainForm : Form
 
     private void UpdateStreamMasterStripSummary()
     {
-        var output = FindStreamOutputEndpoint();
-        streamMasterStripControl.SetStatus(
-            output?.FriendlyName ?? "No output",
-            output is null ? Color.FromArgb(190, 196, 205) : Color.FromArgb(130, 210, 255));
-    }
-
-    private void UpdateStreamCaptureDisplays()
-    {
-        foreach (var controls in streamChannelControlsByName.Values)
-        {
-            var input = FindStreamCaptureEndpoint(controls.ChannelName);
-            controls.StripControl.SetStatus(
-                input?.FriendlyName ?? "Input not found",
-                input is null ? Color.Firebrick : Color.FromArgb(130, 210, 255));
-        }
-    }
-
-    private void SetStreamMasterVolumeUiValue(int volumePercent)
-    {
-        updatingStreamUi = true;
-        streamMasterStripControl.VolumePercent = volumePercent;
-        updatingStreamUi = false;
+        UpdateMasterStripSummary();
     }
 
     private void SetMixerStreamMasterVolumeUiValue(int volumePercent)
@@ -1740,26 +1611,9 @@ public partial class MainForm : Form
         updatingStreamUi = false;
     }
 
-    private void SetStreamMasterMuteUiValue(bool isMuted)
-    {
-        streamMasterStripControl.IsMuted = isMuted;
-    }
-
     private void SetMixerStreamMasterMuteUiValue(bool isMuted)
     {
         masterStripControl.StreamMuted = isMuted;
-    }
-
-    private void SetStreamChannelVolumeUiValue(string channelName, int volumePercent)
-    {
-        if (!streamChannelControlsByName.TryGetValue(channelName, out var controls))
-        {
-            return;
-        }
-
-        controls.IsUpdating = true;
-        controls.StripControl.VolumePercent = volumePercent;
-        controls.IsUpdating = false;
     }
 
     private void SetMixerStreamChannelVolumeUiValue(string channelName, int volumePercent)
@@ -1772,16 +1626,6 @@ public partial class MainForm : Form
         controls.IsUpdating = true;
         controls.StripControl.StreamPercent = volumePercent;
         controls.IsUpdating = false;
-    }
-
-    private void SetStreamChannelMuteUiValue(string channelName, bool isMuted)
-    {
-        if (!streamChannelControlsByName.TryGetValue(channelName, out var controls))
-        {
-            return;
-        }
-
-        controls.StripControl.IsMuted = isMuted;
     }
 
     private void SetMixerStreamChannelMuteUiValue(string channelName, bool isMuted)
@@ -1851,6 +1695,30 @@ public partial class MainForm : Form
 
     private void HandleEndpointSelectionChanged(ChannelControls controls)
     {
+        if (controls.IsUpdating)
+        {
+            return;
+        }
+
+        var endpoint = (controls.StripControl.EndpointComboBox.SelectedItem as EndpointChoice)?.Endpoint;
+        controls.Channel.SelectedEndpointId = endpoint?.Id;
+        controls.Channel.SelectedEndpointName = endpoint?.FriendlyName;
+
+        if (endpoint is null)
+        {
+            MarkEndpointUnavailable(controls, "Not found");
+            AppendLog($"{controls.Channel.Name} routing endpoint cleared.");
+        }
+        else
+        {
+            SyncChannelFromEndpoint(controls, logErrors: false);
+            AppendLog($"{controls.Channel.Name} routing endpoint = {endpoint.FriendlyName}");
+        }
+
+        SaveRoutingRulesFromGrid(persist: false);
+        BindAppSessionsGrid();
+        UpdateChannelControlAvailability();
+        SaveSettings();
     }
 
     private void SyncChannelFromEndpoint(ChannelControls controls, bool logErrors)
@@ -1959,6 +1827,7 @@ public partial class MainForm : Form
     private static void SetEndpointControlsEnabled(ChannelControls controls, bool enabled)
     {
         controls.StripControl.SetMixControlsEnabled(enabled);
+        controls.StripControl.SetEndpointSelectorEnabled(enabled);
     }
 
     private void MarkEndpointUnavailable(ChannelControls controls, string status)
@@ -1981,7 +1850,9 @@ public partial class MainForm : Form
 
     private static void SetStatus(ChannelControls controls, string status)
     {
-        controls.StripControl.AppSummary = status;
+        controls.StripControl.EndpointComboBox.BackColor = status is "Error" or "Not found"
+            ? Color.FromArgb(64, 31, 36)
+            : Color.FromArgb(24, 27, 33);
     }
 
     private void LoadRoutingOptions()
@@ -2663,6 +2534,7 @@ public partial class MainForm : Form
 
         AssignChannelsToSessions();
         appGroups = BuildAppGroups();
+        UpdateMixerAppSummaries();
 
         if (persist)
         {
@@ -2693,9 +2565,9 @@ public partial class MainForm : Form
 
     private string FormatAssignedAppsSummary(string channelName)
     {
-        var assignedApps = settings.RoutingRules
-            .Where(rule => rule.Enabled && rule.PreferredChannel.Equals(channelName, StringComparison.OrdinalIgnoreCase))
-            .Select(rule => rule.ProcessName)
+        var assignedApps = appGroups
+            .Where(group => group.AssignedChannel.Equals(channelName, StringComparison.OrdinalIgnoreCase))
+            .Select(group => group.ProcessName)
             .Where(processName => !string.IsNullOrWhiteSpace(processName))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(processName => processName, StringComparer.OrdinalIgnoreCase)
@@ -2713,13 +2585,6 @@ public partial class MainForm : Form
         }
 
         return string.Join(Environment.NewLine, visibleApps);
-    }
-
-    private IEnumerable<string> GetProcessNamesForChannel(string channelName)
-    {
-        return settings.RoutingRules
-            .Where(rule => rule.Enabled && rule.PreferredChannel.Equals(channelName, StringComparison.OrdinalIgnoreCase))
-            .Select(rule => rule.ProcessName);
     }
 
     private Dictionary<string, AppRoutingRule> GetRoutingRuleMap()
@@ -3126,17 +2991,6 @@ public partial class MainForm : Form
         public MixerChannel Channel { get; } = channel;
 
         public DualMixChannelStripControl StripControl { get; } = stripControl;
-
-        public bool IsUpdating { get; set; }
-    }
-
-    private sealed class StreamChannelControls(
-        string channelName,
-        ChannelStripControl stripControl)
-    {
-        public string ChannelName { get; } = channelName;
-
-        public ChannelStripControl StripControl { get; } = stripControl;
 
         public bool IsUpdating { get; set; }
     }

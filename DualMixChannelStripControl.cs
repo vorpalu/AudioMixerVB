@@ -14,6 +14,7 @@ public sealed class DualMixChannelStripControl : UserControl
     private readonly TableLayoutPanel layout = new();
     private readonly Label iconLabel = new();
     private readonly Label nameLabel = new();
+    private readonly ComboBox endpointComboBox = new();
     private readonly TableLayoutPanel mixesLayout = new();
     private readonly Label appSummaryLabel = new();
     private readonly VuMeterControl monitorVuMeter = new();
@@ -38,7 +39,7 @@ public sealed class DualMixChannelStripControl : UserControl
 
         Dock = DockStyle.Fill;
         Margin = new Padding(6);
-        MinimumSize = new Size(168, 430);
+        MinimumSize = new Size(168, 452);
         BackColor = SurfaceColor;
         Padding = new Padding(1);
 
@@ -48,12 +49,13 @@ public sealed class DualMixChannelStripControl : UserControl
 
         layout.ColumnCount = 1;
         layout.Dock = DockStyle.Fill;
-        layout.RowCount = 4;
+        layout.RowCount = 5;
         layout.BackColor = SurfaceColor;
         layout.Padding = new Padding(8, 9, 8, 8);
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 31F));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66F));
 
@@ -68,6 +70,15 @@ public sealed class DualMixChannelStripControl : UserControl
         nameLabel.ForeColor = PrimaryTextColor;
         nameLabel.Text = "Channel";
         nameLabel.TextAlign = ContentAlignment.MiddleCenter;
+
+        endpointComboBox.Dock = DockStyle.Fill;
+        endpointComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        endpointComboBox.FlatStyle = FlatStyle.Flat;
+        endpointComboBox.BackColor = InnerColor;
+        endpointComboBox.ForeColor = PrimaryTextColor;
+        endpointComboBox.Font = new Font("Segoe UI", 8F);
+        endpointComboBox.Margin = new Padding(0, 2, 0, 3);
+        endpointComboBox.DropDownWidth = 320;
 
         mixesLayout.ColumnCount = 2;
         mixesLayout.Dock = DockStyle.Fill;
@@ -90,8 +101,9 @@ public sealed class DualMixChannelStripControl : UserControl
 
         layout.Controls.Add(iconLabel, 0, 0);
         layout.Controls.Add(nameLabel, 0, 1);
-        layout.Controls.Add(mixesLayout, 0, 2);
-        layout.Controls.Add(appSummaryLabel, 0, 3);
+        layout.Controls.Add(endpointComboBox, 0, 2);
+        layout.Controls.Add(mixesLayout, 0, 3);
+        layout.Controls.Add(appSummaryLabel, 0, 4);
 
         Controls.Add(layout);
         Controls.Add(accentPanel);
@@ -113,6 +125,8 @@ public sealed class DualMixChannelStripControl : UserControl
     public VuMeterControl MonitorVuMeter => monitorVuMeter;
 
     public VuMeterControl StreamVuMeter => streamVuMeter;
+
+    public ComboBox EndpointComboBox => endpointComboBox;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string ChannelName
@@ -195,12 +209,24 @@ public sealed class DualMixChannelStripControl : UserControl
         set => appSummaryLabel.Text = string.IsNullOrWhiteSpace(value) ? "No apps" : value;
     }
 
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool EndpointComboBoxVisible
+    {
+        get => endpointComboBox.Visible;
+        set => endpointComboBox.Visible = value;
+    }
+
     public void SetMixControlsEnabled(bool enabled)
     {
         monitorTrackBar.Enabled = enabled;
         streamTrackBar.Enabled = enabled;
         monitorMuteButton.Enabled = enabled;
         streamMuteButton.Enabled = enabled;
+    }
+
+    public void SetEndpointSelectorEnabled(bool enabled)
+    {
+        endpointComboBox.Enabled = enabled;
     }
 
     protected override void OnPaint(PaintEventArgs e)
