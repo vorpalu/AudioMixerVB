@@ -32,7 +32,7 @@ public sealed class MonitorMixSettings
 
     public bool MasterMuted { get; set; }
 
-    public int LatencyMs { get; set; } = 60;
+    public int LatencyMs { get; set; } = 20;
 
     public string ChannelSliderMode { get; set; } = "Monitor Mix Gain";
 

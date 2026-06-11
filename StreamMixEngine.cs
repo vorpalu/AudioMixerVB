@@ -8,6 +8,7 @@ public sealed class StreamMixEngine : IDisposable
 {
     private const int MixSampleRate = 48000;
     private const int MixChannels = 2;
+    private const int CaptureBufferMs = 20;
     private readonly object syncRoot = new();
     private readonly Dictionary<string, string> channelInputEndpointIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, float> channelGains = new(StringComparer.OrdinalIgnoreCase);
@@ -52,7 +53,7 @@ public sealed class StreamMixEngine : IDisposable
         }
     }
 
-    public int LatencyMs { get; set; } = 60;
+    public int LatencyMs { get; set; } = 20;
 
     public float GetChannelPeak(string channelName)
     {
@@ -237,14 +238,16 @@ public sealed class StreamMixEngine : IDisposable
             }
 
             var captureDevice = FindDevice(endpointId, NAudio.CoreAudioApi.DataFlow.Capture);
-            var capture = new WasapiCapture(captureDevice);
+            var capture = new WasapiCapture(captureDevice, true, CaptureBufferMs);
             var bufferedProvider = new BufferedWaveProvider(capture.WaveFormat)
             {
-                BufferDuration = TimeSpan.FromMilliseconds(Math.Max(500, LatencyMs * 12)),
+                BufferDuration = TimeSpan.FromMilliseconds(Math.Max(200, LatencyMs * 4)),
                 DiscardOnBufferOverflow = true,
                 ReadFully = true
             };
 
+            var trimBuffer = new byte[capture.WaveFormat.AverageBytesPerSecond / 4];
+            var lastTrimLogTicks = 0L;
             EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
             {
                 if (IsStopping)
@@ -255,6 +258,39 @@ public sealed class StreamMixEngine : IDisposable
                 try
                 {
                     bufferedProvider.AddSamples(args.Buffer, 0, args.BytesRecorded);
+
+                    // Capture and render run on different device clocks; when capture drifts
+                    // ahead the queue grows and so does latency. Skip ahead to keep it bounded.
+                    var format = bufferedProvider.WaveFormat;
+                    var maxBacklogBytes = (long)format.AverageBytesPerSecond * Math.Max(50, LatencyMs * 2) / 1000;
+                    if (bufferedProvider.BufferedBytes > maxBacklogBytes)
+                    {
+                        var targetBytes = (long)format.AverageBytesPerSecond * Math.Max(20, LatencyMs) / 1000;
+                        var excessBytes = bufferedProvider.BufferedBytes - (int)targetBytes;
+                        excessBytes -= excessBytes % format.BlockAlign;
+                        var droppedBytes = 0;
+                        while (excessBytes > 0)
+                        {
+                            var chunk = Math.Min(excessBytes, trimBuffer.Length);
+                            chunk -= chunk % format.BlockAlign;
+                            var read = bufferedProvider.Read(trimBuffer, 0, chunk);
+                            if (read <= 0)
+                            {
+                                break;
+                            }
+
+                            droppedBytes += read;
+                            excessBytes -= read;
+                        }
+
+                        var now = Environment.TickCount64;
+                        if (droppedBytes > 0 && now - lastTrimLogTicks >= 5000)
+                        {
+                            lastTrimLogTicks = now;
+                            var droppedMs = droppedBytes * 1000L / format.AverageBytesPerSecond;
+                            OnLog?.Invoke(this, $"Stream {channelName} backlog trimmed by {droppedMs} ms to limit latency drift.");
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -310,7 +346,7 @@ public sealed class StreamMixEngine : IDisposable
         }
 
         masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, UpdateMasterMeter);
-        output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, false, LatencyMs);
+        output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, true, LatencyMs);
         output.Init(masterProvider.ToWaveProvider());
 
         foreach (var channel in captureChannels)

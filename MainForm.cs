@@ -52,7 +52,7 @@ public partial class MainForm : Form
     private Button stopMonitorButton = null!;
     private Button restartMonitorButton = null!;
     private Label monitorStatusValueLabel = null!;
-    private Label monitorLatencyValueLabel = null!;
+    private NumericUpDown monitorLatencyNumericUpDown = null!;
     private Label monitorWarningLabel = null!;
     private GroupBox streamMixGroupBox = null!;
     private TableLayoutPanel streamMixLayout = null!;
@@ -195,6 +195,7 @@ public partial class MainForm : Form
         masterStripControl.MonitorMuteButton.Click += (_, _) => ToggleMonitorMasterMute();
         masterStripControl.StreamTrackBar.ValueChanged += (_, _) => HandleMixerStreamMasterGainChanged();
         masterStripControl.StreamMuteButton.Click += (_, _) => ToggleMixerStreamMasterMute();
+        monitorLatencyNumericUpDown.ValueChanged += (_, _) => HandleMonitorLatencyChanged();
         startMonitorButton.Click += (_, _) => StartMonitor();
         stopMonitorButton.Click += async (_, _) => await StopMonitorAsync();
         restartMonitorButton.Click += async (_, _) => await RestartMonitorAsync();
@@ -312,7 +313,14 @@ public partial class MainForm : Form
         stopMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Stop", UseVisualStyleBackColor = true };
         restartMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Restart", UseVisualStyleBackColor = true };
         monitorStatusValueLabel = new Label { Dock = DockStyle.Fill, Text = "Stopped", TextAlign = ContentAlignment.MiddleLeft };
-        monitorLatencyValueLabel = new Label { Dock = DockStyle.Fill, Text = $"{settings.MonitorMix.LatencyMs} ms", TextAlign = ContentAlignment.MiddleLeft };
+        monitorLatencyNumericUpDown = new NumericUpDown
+        {
+            Dock = DockStyle.Fill,
+            Minimum = 10,
+            Maximum = 500,
+            Increment = 5,
+            Value = Math.Clamp(settings.MonitorMix.LatencyMs, 10, 500)
+        };
         monitorWarningLabel = new Label
         {
             Dock = DockStyle.Fill,
@@ -323,7 +331,7 @@ public partial class MainForm : Form
         AddMonitorRow(0, "Output", monitorOutputComboBox, "Mode", channelSliderModeComboBox);
         AddMonitorRow(1, "Game", monitorGameInputComboBox, "Chat", monitorChatInputComboBox);
         AddMonitorRow(2, "Music", monitorMusicInputComboBox, "Media", monitorMediaInputComboBox);
-        AddMonitorRow(3, "Status", monitorStatusValueLabel, "Latency", monitorLatencyValueLabel);
+        AddMonitorRow(3, "Status", monitorStatusValueLabel, "Latency", monitorLatencyNumericUpDown);
 
         monitorMixLayout.Controls.Add(startMonitorButton, 0, 6);
         monitorMixLayout.SetColumnSpan(startMonitorButton, 2);
@@ -385,10 +393,10 @@ public partial class MainForm : Form
         streamLatencyNumericUpDown = new NumericUpDown
         {
             Dock = DockStyle.Fill,
-            Minimum = 20,
+            Minimum = 10,
             Maximum = 500,
             Increment = 5,
-            Value = settings.StreamMix.LatencyMs
+            Value = Math.Clamp(settings.StreamMix.LatencyMs, 10, 500)
         };
         streamWarningLabel = new Label
         {
@@ -1084,7 +1092,7 @@ public partial class MainForm : Form
         PopulateMonitorInputComboBox(monitorMediaInputComboBox, "Media");
 
         channelSliderModeComboBox.SelectedItem = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
-        monitorLatencyValueLabel.Text = $"{settings.MonitorMix.LatencyMs} ms";
+        monitorLatencyNumericUpDown.Value = Math.Clamp(settings.MonitorMix.LatencyMs, 10, 500);
         SyncMonitorMixControlsFromSettings();
         updatingMonitorUi = false;
 
@@ -1199,7 +1207,7 @@ public partial class MainForm : Form
     {
         updatingStreamUi = true;
         PopulateStreamOutputComboBox();
-        streamLatencyNumericUpDown.Value = Math.Clamp(settings.StreamMix.LatencyMs, 20, 500);
+        streamLatencyNumericUpDown.Value = Math.Clamp(settings.StreamMix.LatencyMs, 10, 500);
         streamLatencyValueLabel.Text = $"{settings.StreamMix.LatencyMs} ms";
         masterStripControl.StreamPercent = GainToPercent(settings.StreamMix.MasterGain);
         masterStripControl.StreamMuted = settings.StreamMix.MasterMuted;
@@ -1534,6 +1542,23 @@ public partial class MainForm : Form
         if (endpoint is not null)
         {
             AppendLog($"Stream output = {endpoint.FriendlyName}");
+        }
+    }
+
+    private void HandleMonitorLatencyChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        settings.MonitorMix.LatencyMs = (int)monitorLatencyNumericUpDown.Value;
+        monitorMixEngine.LatencyMs = settings.MonitorMix.LatencyMs;
+        SaveSettings();
+
+        if (monitorMixEngine.IsRunning)
+        {
+            AppendLog("Monitor latency updated. Restart Monitor to apply it to the active WASAPI output.");
         }
     }
 

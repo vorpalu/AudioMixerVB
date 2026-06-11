@@ -65,7 +65,7 @@ public sealed class AppSettings
             MonitorMix.ChannelMutes ?? [],
             StringComparer.OrdinalIgnoreCase);
         MonitorMix.MasterGain = Math.Clamp(MonitorMix.MasterGain, 0f, 1f);
-        MonitorMix.LatencyMs = Math.Clamp(MonitorMix.LatencyMs, 20, 500);
+        MonitorMix.LatencyMs = Math.Clamp(MonitorMix.LatencyMs, 10, 500);
         MonitorMix.ChannelSliderMode = "Monitor Mix Gain";
 
         foreach (var channelName in MixerChannel.DefaultChannelNames)
@@ -93,7 +93,7 @@ public sealed class AppSettings
             StreamMix.ChannelMutes ?? [],
             StringComparer.OrdinalIgnoreCase);
         StreamMix.MasterGain = Math.Clamp(StreamMix.MasterGain, 0f, 1f);
-        StreamMix.LatencyMs = Math.Clamp(StreamMix.LatencyMs, 20, 500);
+        StreamMix.LatencyMs = Math.Clamp(StreamMix.LatencyMs, 10, 500);
 
         foreach (var channelName in MixerChannel.DefaultChannelNames)
         {
