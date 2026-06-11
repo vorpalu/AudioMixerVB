@@ -261,35 +261,36 @@ public sealed class StreamMixEngine : IDisposable
                     bufferedProvider.AddSamples(args.Buffer, 0, args.BytesRecorded);
 
                     // Capture and render run on different device clocks; when capture drifts
-                    // ahead the queue grows and so does latency. Skip ahead to keep it bounded.
+                    // ahead the queue grows and so does latency. Skip ahead gently to keep it
+                    // bounded. The backlog must be re-read on every pass: the playback thread
+                    // drains this buffer concurrently, and with ReadFully enabled Read never
+                    // reports starvation, so a stale excess would over-trim into silence.
                     var format = bufferedProvider.WaveFormat;
-                    var maxBacklogBytes = (long)format.AverageBytesPerSecond * Math.Max(30, LatencyMs * 2) / 1000;
-                    if (bufferedProvider.BufferedBytes > maxBacklogBytes)
+                    var bytesPerMs = Math.Max(1, format.AverageBytesPerSecond / 1000);
+                    var targetBytes = bytesPerMs * Math.Max(15, LatencyMs);
+                    var thresholdBytes = targetBytes + bytesPerMs * Math.Max(15, LatencyMs);
+                    if (bufferedProvider.BufferedBytes > thresholdBytes)
                     {
-                        var targetBytes = (long)format.AverageBytesPerSecond * Math.Max(10, LatencyMs) / 1000;
-                        var excessBytes = bufferedProvider.BufferedBytes - (int)targetBytes;
-                        excessBytes -= excessBytes % format.BlockAlign;
+                        var maxTrimBytes = bytesPerMs * 10;
                         var droppedBytes = 0;
-                        while (excessBytes > 0)
+                        while (droppedBytes < maxTrimBytes)
                         {
-                            var chunk = Math.Min(excessBytes, trimBuffer.Length);
+                            var excessBytes = bufferedProvider.BufferedBytes - targetBytes;
+                            var chunk = Math.Min(Math.Min(excessBytes, maxTrimBytes - droppedBytes), trimBuffer.Length);
                             chunk -= chunk % format.BlockAlign;
-                            var read = bufferedProvider.Read(trimBuffer, 0, chunk);
-                            if (read <= 0)
+                            if (chunk <= 0)
                             {
                                 break;
                             }
 
-                            droppedBytes += read;
-                            excessBytes -= read;
+                            droppedBytes += bufferedProvider.Read(trimBuffer, 0, chunk);
                         }
 
                         var now = Environment.TickCount64;
                         if (droppedBytes > 0 && now - lastTrimLogTicks >= 5000)
                         {
                             lastTrimLogTicks = now;
-                            var droppedMs = droppedBytes * 1000L / format.AverageBytesPerSecond;
-                            OnLog?.Invoke(this, $"Stream {channelName} backlog trimmed by {droppedMs} ms to limit latency drift.");
+                            OnLog?.Invoke(this, $"Stream {channelName} backlog trimmed by {droppedBytes / bytesPerMs} ms to limit latency drift.");
                         }
                     }
                 }
