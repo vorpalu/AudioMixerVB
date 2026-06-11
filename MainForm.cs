@@ -3233,7 +3233,10 @@ public partial class MainForm : Form
                 var status = success
                     ? "Routed preference saved"
                     : outcome.Results.LastOrDefault()?.Status ?? "Error";
-                lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(DateTime.UtcNow, status);
+                lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(
+                    DateTime.UtcNow,
+                    status,
+                    string.Join(",", outcome.Request.ProcessIds));
 
                 foreach (var result in outcome.Results)
                 {
@@ -3306,23 +3309,49 @@ public partial class MainForm : Form
                 continue;
             }
 
-            if (lastAutoRoutingAttempts.TryGetValue(routeKey, out var lastAttempt) &&
-                now - lastAttempt.Utc < autoRoutingCooldown)
+            var routablePids = group.ProcessIds.Where(pid => pid > 0).OrderBy(pid => pid).ToList();
+            if (routablePids.Count == 0)
             {
                 LogRoutingMessage(
-                    $"auto-apply-recent:{routeKey}",
-                    $"Auto apply skipped: recently applied {group.ProcessName}.",
+                    $"auto-apply-unroutable:{routeKey}",
+                    $"Auto apply skipped: {group.ProcessName} has no routable process.",
                     autoTriggered: true);
                 continue;
             }
 
-            lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(now, "Started");
+            var pidSignature = string.Join(",", routablePids);
+            if (lastAutoRoutingAttempts.TryGetValue(routeKey, out var lastAttempt))
+            {
+                // Re-routing an app whose preference is already saved only helps once
+                // its process set changes (restart); repeating the policy write every
+                // cycle makes audiosrv re-evaluate live streams and glitches audio.
+                if (lastAttempt.Status.Equals("Routed preference saved", StringComparison.OrdinalIgnoreCase) &&
+                    lastAttempt.PidSignature == pidSignature)
+                {
+                    LogRoutingMessage(
+                        $"auto-apply-saved:{routeKey}",
+                        $"Auto apply skipped: routing preference already saved for {group.ProcessName}.",
+                        autoTriggered: true);
+                    continue;
+                }
+
+                if (now - lastAttempt.Utc < autoRoutingCooldown)
+                {
+                    LogRoutingMessage(
+                        $"auto-apply-recent:{routeKey}",
+                        $"Auto apply skipped: recently applied {group.ProcessName}.",
+                        autoTriggered: true);
+                    continue;
+                }
+            }
+
+            lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(now, "Started", pidSignature);
             requests.Add(new AutoRoutingRequest(
                 group.ProcessName,
                 group.AssignedChannel,
                 group.TargetEndpointId,
                 group.TargetEndpointFriendlyName,
-                group.ProcessIds.ToList()));
+                routablePids));
         }
 
         return requests;
@@ -3748,7 +3777,7 @@ public partial class MainForm : Form
         public bool IsUpdating { get; set; }
     }
 
-    private sealed record AutoRoutingAttempt(DateTime Utc, string Status);
+    private sealed record AutoRoutingAttempt(DateTime Utc, string Status, string PidSignature = "");
 
     private sealed record AutoRoutingRequest(
         string ProcessName,

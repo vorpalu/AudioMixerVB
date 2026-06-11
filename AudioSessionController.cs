@@ -139,16 +139,33 @@ public sealed class AudioSessionController
 
     private void EnumerateSessions(IReadOnlyList<AudioEndpoint> endpoints, Action<SessionContext> action)
     {
+        var enumerator = IntPtr.Zero;
+
+        try
+        {
+            enumerator = CreateDeviceEnumerator();
+            EnumerateSessions(enumerator, endpoints, action);
+        }
+        catch (Exception ex)
+        {
+            LogMessage?.Invoke(this, $"Audio session enumeration error: {ex.Message}");
+        }
+        finally
+        {
+            ReleaseComPointer(ref enumerator);
+        }
+    }
+
+    private void EnumerateSessions(IntPtr enumerator, IReadOnlyList<AudioEndpoint> endpoints, Action<SessionContext> action)
+    {
         foreach (var endpoint in endpoints)
         {
-            var enumerator = IntPtr.Zero;
             var device = IntPtr.Zero;
             var sessionManager = IntPtr.Zero;
             var sessionEnumerator = IntPtr.Zero;
 
             try
             {
-                enumerator = CreateDeviceEnumerator();
                 device = GetDevice(enumerator, endpoint.Id);
                 sessionManager = ActivateAudioSessionManager(device);
                 sessionEnumerator = GetSessionEnumerator(sessionManager);
@@ -208,7 +225,6 @@ public sealed class AudioSessionController
                 ReleaseComPointer(ref sessionEnumerator);
                 ReleaseComPointer(ref sessionManager);
                 ReleaseComPointer(ref device);
-                ReleaseComPointer(ref enumerator);
             }
         }
     }
