@@ -250,6 +250,7 @@ public sealed class StreamMixEngine : IDisposable
             var lastTrimLogTicks = 0L;
             EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
             {
+                ProAudioThread.Register();
                 if (IsStopping)
                 {
                     return;
@@ -262,10 +263,10 @@ public sealed class StreamMixEngine : IDisposable
                     // Capture and render run on different device clocks; when capture drifts
                     // ahead the queue grows and so does latency. Skip ahead to keep it bounded.
                     var format = bufferedProvider.WaveFormat;
-                    var maxBacklogBytes = (long)format.AverageBytesPerSecond * Math.Max(50, LatencyMs * 2) / 1000;
+                    var maxBacklogBytes = (long)format.AverageBytesPerSecond * Math.Max(30, LatencyMs * 2) / 1000;
                     if (bufferedProvider.BufferedBytes > maxBacklogBytes)
                     {
-                        var targetBytes = (long)format.AverageBytesPerSecond * Math.Max(20, LatencyMs) / 1000;
+                        var targetBytes = (long)format.AverageBytesPerSecond * Math.Max(10, LatencyMs) / 1000;
                         var excessBytes = bufferedProvider.BufferedBytes - (int)targetBytes;
                         excessBytes -= excessBytes % format.BlockAlign;
                         var droppedBytes = 0;
@@ -727,6 +728,7 @@ public sealed class StreamMixEngine : IDisposable
 
         public int Read(float[] buffer, int offset, int count)
         {
+            ProAudioThread.Register();
             var read = source.Read(buffer, offset, count);
 
             float currentGain;

@@ -34,6 +34,8 @@ public sealed class MonitorMixSettings
 
     public int LatencyMs { get; set; } = 20;
 
+    public bool ExclusiveOutput { get; set; }
+
     public string ChannelSliderMode { get; set; } = "Monitor Mix Gain";
 
     public string? GetCaptureEndpointId(string channelName)

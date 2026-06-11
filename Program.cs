@@ -14,6 +14,19 @@ static class Program
             return;
         }
 
+        // Low-latency audio runs in user mode here; keep GC pauses short and let the
+        // process compete with other audio software for CPU time.
+        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
+        try
+        {
+            using var process = System.Diagnostics.Process.GetCurrentProcess();
+            process.PriorityClass = System.Diagnostics.ProcessPriorityClass.High;
+        }
+        catch
+        {
+            // Keep default priority if the system denies the change.
+        }
+
         // To customize application configuration such as set high DPI settings or default font,
         // see https://aka.ms/applicationconfiguration.
         ApplicationConfiguration.Initialize();

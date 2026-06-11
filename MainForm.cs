@@ -53,6 +53,7 @@ public partial class MainForm : Form
     private Button restartMonitorButton = null!;
     private Label monitorStatusValueLabel = null!;
     private NumericUpDown monitorLatencyNumericUpDown = null!;
+    private CheckBox monitorExclusiveCheckBox = null!;
     private Label monitorWarningLabel = null!;
     private GroupBox streamMixGroupBox = null!;
     private TableLayoutPanel streamMixLayout = null!;
@@ -196,6 +197,7 @@ public partial class MainForm : Form
         masterStripControl.StreamTrackBar.ValueChanged += (_, _) => HandleMixerStreamMasterGainChanged();
         masterStripControl.StreamMuteButton.Click += (_, _) => ToggleMixerStreamMasterMute();
         monitorLatencyNumericUpDown.ValueChanged += (_, _) => HandleMonitorLatencyChanged();
+        monitorExclusiveCheckBox.CheckedChanged += (_, _) => HandleMonitorExclusiveChanged();
         startMonitorButton.Click += (_, _) => StartMonitor();
         stopMonitorButton.Click += async (_, _) => await StopMonitorAsync();
         restartMonitorButton.Click += async (_, _) => await RestartMonitorAsync();
@@ -332,6 +334,15 @@ public partial class MainForm : Form
         AddMonitorRow(1, "Game", monitorGameInputComboBox, "Chat", monitorChatInputComboBox);
         AddMonitorRow(2, "Music", monitorMusicInputComboBox, "Media", monitorMediaInputComboBox);
         AddMonitorRow(3, "Status", monitorStatusValueLabel, "Latency", monitorLatencyNumericUpDown);
+
+        monitorExclusiveCheckBox = new CheckBox
+        {
+            Dock = DockStyle.Fill,
+            Text = "Exclusive output (lowest latency, locks the device)",
+            Checked = settings.MonitorMix.ExclusiveOutput
+        };
+        monitorMixLayout.Controls.Add(monitorExclusiveCheckBox, 1, 4);
+        monitorMixLayout.SetColumnSpan(monitorExclusiveCheckBox, 3);
 
         monitorMixLayout.Controls.Add(startMonitorButton, 0, 6);
         monitorMixLayout.SetColumnSpan(startMonitorButton, 2);
@@ -1093,6 +1104,7 @@ public partial class MainForm : Form
 
         channelSliderModeComboBox.SelectedItem = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
         monitorLatencyNumericUpDown.Value = Math.Clamp(settings.MonitorMix.LatencyMs, 10, 500);
+        monitorExclusiveCheckBox.Checked = settings.MonitorMix.ExclusiveOutput;
         SyncMonitorMixControlsFromSettings();
         updatingMonitorUi = false;
 
@@ -1372,6 +1384,7 @@ public partial class MainForm : Form
     private void ApplyMonitorSettingsToEngine()
     {
         monitorMixEngine.LatencyMs = settings.MonitorMix.LatencyMs;
+        monitorMixEngine.UseExclusiveOutput = settings.MonitorMix.ExclusiveOutput;
 
         monitorMixEngine.SetOutputDevice(settings.MonitorMix.OutputEndpointId ?? string.Empty);
 
@@ -1559,6 +1572,23 @@ public partial class MainForm : Form
         if (monitorMixEngine.IsRunning)
         {
             AppendLog("Monitor latency updated. Restart Monitor to apply it to the active WASAPI output.");
+        }
+    }
+
+    private void HandleMonitorExclusiveChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        settings.MonitorMix.ExclusiveOutput = monitorExclusiveCheckBox.Checked;
+        monitorMixEngine.UseExclusiveOutput = settings.MonitorMix.ExclusiveOutput;
+        SaveSettings();
+
+        if (monitorMixEngine.IsRunning)
+        {
+            AppendLog("Monitor output mode updated. Restart Monitor to apply it.");
         }
     }
 

@@ -55,6 +55,8 @@ public sealed class MonitorMixEngine : IDisposable
 
     public int LatencyMs { get; set; } = 20;
 
+    public bool UseExclusiveOutput { get; set; }
+
     public float GetChannelPeak(string channelName)
     {
         lock (syncRoot)
@@ -261,6 +263,7 @@ public sealed class MonitorMixEngine : IDisposable
             var lastTrimLogTicks = 0L;
             EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
             {
+                ProAudioThread.Register();
                 if (IsStopping)
                 {
                     return;
@@ -273,10 +276,10 @@ public sealed class MonitorMixEngine : IDisposable
                     // Capture and render run on different device clocks; when capture drifts
                     // ahead the queue grows and so does latency. Skip ahead to keep it bounded.
                     var format = bufferedProvider.WaveFormat;
-                    var maxBacklogBytes = (long)format.AverageBytesPerSecond * Math.Max(50, LatencyMs * 2) / 1000;
+                    var maxBacklogBytes = (long)format.AverageBytesPerSecond * Math.Max(30, LatencyMs * 2) / 1000;
                     if (bufferedProvider.BufferedBytes > maxBacklogBytes)
                     {
-                        var targetBytes = (long)format.AverageBytesPerSecond * Math.Max(20, LatencyMs) / 1000;
+                        var targetBytes = (long)format.AverageBytesPerSecond * Math.Max(10, LatencyMs) / 1000;
                         var excessBytes = bufferedProvider.BufferedBytes - (int)targetBytes;
                         excessBytes -= excessBytes % format.BlockAlign;
                         var droppedBytes = 0;
@@ -357,8 +360,7 @@ public sealed class MonitorMixEngine : IDisposable
         }
 
         masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, UpdateMasterMeter);
-        output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, true, LatencyMs);
-        output.Init(masterProvider.ToWaveProvider());
+        output = CreateOutput(outputDevice, masterProvider);
 
         foreach (var channel in captureChannels)
         {
@@ -367,6 +369,32 @@ public sealed class MonitorMixEngine : IDisposable
 
         output.Play();
         OnLog?.Invoke(this, "Started monitor output.");
+    }
+
+    private WasapiOut CreateOutput(MMDevice outputDevice, MasterSampleProvider master)
+    {
+        if (UseExclusiveOutput)
+        {
+            WasapiOut? exclusive = null;
+            try
+            {
+                // Exclusive mode bypasses the shared Windows audio engine path entirely.
+                // Most devices only accept integer PCM there, so feed 16-bit samples.
+                exclusive = new WasapiOut(outputDevice, AudioClientShareMode.Exclusive, true, LatencyMs);
+                exclusive.Init(new SampleToWaveProvider16(master));
+                OnLog?.Invoke(this, "Monitor output running in WASAPI exclusive mode (16-bit PCM).");
+                return exclusive;
+            }
+            catch (Exception ex)
+            {
+                exclusive?.Dispose();
+                OnLog?.Invoke(this, $"Exclusive mode unavailable ({ex.Message}); falling back to shared mode.");
+            }
+        }
+
+        var shared = new WasapiOut(outputDevice, AudioClientShareMode.Shared, true, LatencyMs);
+        shared.Init(master.ToWaveProvider());
+        return shared;
     }
 
     private void StopCore()
@@ -747,6 +775,7 @@ public sealed class MonitorMixEngine : IDisposable
 
         public int Read(float[] buffer, int offset, int count)
         {
+            ProAudioThread.Register();
             var read = source.Read(buffer, offset, count);
 
             float currentGain;
