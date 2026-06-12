@@ -235,11 +235,13 @@ public sealed class StreamMixEngine : IDisposable
             var capture = new WasapiCapture(captureDevice, true, CaptureBufferMs);
             var bufferedProvider = new BufferedWaveProvider(capture.WaveFormat)
             {
-                BufferDuration = TimeSpan.FromMilliseconds(Math.Max(200, LatencyMs * 4)),
+                BufferDuration = TimeSpan.FromMilliseconds(Math.Max(500, LatencyMs * 4)),
                 DiscardOnBufferOverflow = true,
                 ReadFully = true
             };
 
+            var captureBytesPerMs = Math.Max(1, capture.WaveFormat.AverageBytesPerSecond / 1000);
+            var queueState = new CaptureQueueState(Math.Max(15, LatencyMs));
             var trimBuffer = new byte[capture.WaveFormat.AverageBytesPerSecond / 4];
             var lastTrimLogTicks = 0L;
             EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
@@ -252,6 +254,26 @@ public sealed class StreamMixEngine : IDisposable
 
                 try
                 {
+                    var format = bufferedProvider.WaveFormat;
+                    queueState.OnPacket(args.BytesRecorded / (double)captureBytesPerMs);
+
+                    // A dry queue means the source just (re)started: idle cables stop
+                    // delivering, so the cushion is gone. Pre-fill with silence so playback
+                    // does not starve on every packet boundary for the seconds the servo
+                    // would need to rebuild the cushion at its capped rate.
+                    if (bufferedProvider.BufferedBytes == 0)
+                    {
+                        var prefillBytes = Math.Min(
+                            (int)(queueState.EffectiveTargetMs * captureBytesPerMs),
+                            trimBuffer.Length);
+                        prefillBytes -= prefillBytes % format.BlockAlign;
+                        if (prefillBytes > 0)
+                        {
+                            Array.Clear(trimBuffer, 0, prefillBytes);
+                            bufferedProvider.AddSamples(trimBuffer, 0, prefillBytes);
+                        }
+                    }
+
                     bufferedProvider.AddSamples(args.Buffer, 0, args.BytesRecorded);
 
                     // Ordinary clock drift is corrected inaudibly by the servo resampler;
@@ -259,10 +281,8 @@ public sealed class StreamMixEngine : IDisposable
                     // burst queued. The backlog must be re-read on every pass: the playback
                     // thread drains this buffer concurrently, and with ReadFully enabled
                     // Read never reports starvation, so a stale excess would over-trim.
-                    var format = bufferedProvider.WaveFormat;
-                    var bytesPerMs = Math.Max(1, format.AverageBytesPerSecond / 1000);
-                    var targetBytes = bytesPerMs * Math.Max(15, LatencyMs);
-                    var thresholdBytes = targetBytes + bytesPerMs * 60;
+                    var targetBytes = (int)(queueState.EffectiveTargetMs * captureBytesPerMs);
+                    var thresholdBytes = targetBytes + captureBytesPerMs * 60;
                     if (bufferedProvider.BufferedBytes > thresholdBytes)
                     {
                         var droppedBytes = 0;
@@ -283,7 +303,7 @@ public sealed class StreamMixEngine : IDisposable
                         if (droppedBytes > 0 && now - lastTrimLogTicks >= 5000)
                         {
                             lastTrimLogTicks = now;
-                            OnLog?.Invoke(this, $"Stream {channelName} stall recovery: dropped {droppedBytes / bytesPerMs} ms of queued audio.");
+                            OnLog?.Invoke(this, $"Stream {channelName} stall recovery: dropped {droppedBytes / captureBytesPerMs} ms of queued audio.");
                         }
                     }
                 }
@@ -314,12 +334,11 @@ public sealed class StreamMixEngine : IDisposable
 
             // The servo resampler keeps the queue at the target depth by nudging the
             // playback rate, so per-cable clock drift never accumulates into trims.
-            var captureBytesPerMs = Math.Max(1, capture.WaveFormat.AverageBytesPerSecond / 1000);
             sampleProvider = new DriftCompensatingSampleProvider(
                 sampleProvider,
                 MixSampleRate,
                 () => (double)bufferedProvider.BufferedBytes / captureBytesPerMs,
-                Math.Max(15, LatencyMs));
+                () => queueState.EffectiveTargetMs);
 
             // Resolve the meter once so the playback thread updates it directly and
             // never touches syncRoot, which the UI meter timer locks ~25x per second.

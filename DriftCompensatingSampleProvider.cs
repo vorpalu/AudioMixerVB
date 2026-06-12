@@ -19,7 +19,7 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
     private readonly ISampleProvider source;
     private readonly WdlResampler resampler;
     private readonly Func<double> backlogMs;
-    private readonly double targetBacklogMs;
+    private readonly Func<double> targetBacklogMs;
     private readonly int channels;
     private double smoothedBacklogMs = double.NaN;
 
@@ -27,7 +27,7 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
         ISampleProvider source,
         int outputSampleRate,
         Func<double> backlogMs,
-        double targetBacklogMs)
+        Func<double> targetBacklogMs)
     {
         this.source = source;
         this.backlogMs = backlogMs;
@@ -61,7 +61,7 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
             : smoothedBacklogMs + BacklogSmoothing * (measured - smoothedBacklogMs);
 
         var correction = Math.Clamp(
-            (smoothedBacklogMs - targetBacklogMs) * CorrectionPerMsError,
+            (smoothedBacklogMs - targetBacklogMs()) * CorrectionPerMsError,
             -MaxRateCorrection,
             MaxRateCorrection);
         resampler.SetRates(source.WaveFormat.SampleRate * (1.0 + correction), WaveFormat.SampleRate);
