@@ -66,7 +66,7 @@ The file is written next to the executable and stores:
 - channel volume mode
 - experimental/auto routing options
 - monitor mix output/input endpoints
-- monitor mix master gain, channel gains, mutes, latency, and slider mode
+- monitor mix master gain, channel gains, mutes, latency, exclusive output mode, and slider mode
 - stream mix output endpoint
 - stream mix master gain, channel gains, mutes, and latency
 - selected COM port
@@ -177,7 +177,11 @@ The audio policy factory is activated with `RoGetActivationFactory`, but the ret
 
 Automatic routing writes the Windows per-app output preference. Some applications move immediately, while others keep the current audio stream until playback restarts or the app is fully restarted. If automatic routing fails, use Windows Volume Mixer manually; the manual fallback remains supported.
 
-`Auto apply` refreshes and applies routing rules every three seconds without repeating identical log messages.
+`Auto apply` refreshes and applies routing rules every few seconds without repeating identical log messages. It is designed to leave the audio engine alone in steady state:
+
+- The persisted per-app output preference is read first and only written when it does not already match the target, because every write makes Windows re-evaluate the app's live streams (audible as a brief glitch).
+- After a successful write, the rule is not re-applied until the app's process set changes (for example, after an app restart).
+- `System Sounds` (PID 0) cannot be routed through the API at all; it always follows the Windows default output device. To land system sounds on a channel, set the matching VB-CABLE Input as the Windows default playback device.
 
 The Mixer tab controls Monitor Mix gain. It does not change Windows app-session volume or VB-CABLE endpoint volume, because those source-level changes would affect both Monitor and Stream mixes.
 
@@ -221,6 +225,8 @@ Channel slider mode:
 - `Monitor Mix Gain`: channel sliders control only the Monitor Mix heard in headphones.
 
 `Monitor Mix Gain` is the default. Monitor gain is a 0.0-1.0 scalar and is not boosted above unity.
+
+Monitor latency is adjustable from the Monitor Mix panel (10-500 ms, default 20). The `Exclusive output` checkbox switches the monitor output to WASAPI exclusive mode (16-bit PCM), which bypasses the shared Windows audio engine for the lowest output latency; if exclusive mode is unavailable the engine falls back to shared mode automatically and logs why. Exclusive mode locks the output device, which is safe in this design because all applications render into VB-CABLE devices, not the physical output.
 
 AudioMixerVB keeps Monitor Mix gains separate from Stream Mix gains. App Session Volume changes Windows app volume before audio reaches both Monitor and Stream mixes, so it is not used by the Mixer tab when independent monitor/stream mixes are needed.
 
@@ -318,6 +324,26 @@ Expected result:
 - OBS receives Stream Mix from `CABLE Output (VB-Audio Virtual Cable)`.
 - Changing Stream Music gain does not change headphone volume.
 - Changing Monitor Music gain does not change OBS volume.
+
+## Low-Latency Engine
+
+Both mix engines use event-driven WASAPI capture (20 ms buffers) and event-driven output. The process runs at high priority, audio threads register with MMCSS as `Pro Audio`, and the GC runs in sustained low-latency mode. Default mix latency is 20 ms per engine (adjustable 10-500 ms).
+
+Each channel passes through a drift-compensating resampler that converts the capture format to the 48 kHz mix and servo-adjusts the effective rate (up to ±1%, with a -3% panic brake when the queue gets critically low) so the capture queue stays at its target depth. Clock drift between a virtual cable and the physical output is corrected continuously and inaudibly instead of by skipping samples.
+
+The queue target adapts per channel to what its cable actually does: peak packet size, peak output read size, peak delivery gaps, and an escalating surcharge when the queue keeps running dry. A channel on a well-behaved cable keeps a tight ~25-40 ms cushion; a channel on a cable that stalls buys itself just enough cushion to survive, and the surcharge decays while the cable behaves. When a queue runs dry (a cable stopped delivering), it is pre-filled with silence so the restarting stream has its cushion immediately.
+
+Log messages to know:
+
+- `servo: backlog X ms, target Y ms, rate correction Z%`: per-channel health line every 30 seconds. A correction pinned at ±1.00% means the cable clock is outside the servo's reach.
+- `queue ran dry; inserted N ms cushion (...)`: the cable paused. `AUDIBLE interruption` means real audio was cut; `source silent for N ms` and `no audio seen yet` are harmless idle-pump restarts.
+- `stall recovery: dropped N ms`: a large burst was skipped after a real system stall.
+- `output read gap of N ms`: the playback thread itself stalled (GC, driver, scheduler).
+
+VB-CABLE driver configuration matters more than any in-app setting:
+
+- Keep the sample rate identical on both sides of each cable (the `Input` render endpoint and the `Output` capture endpoint) in Windows sound settings. A mismatch forces the driver to resample internally and can make its delivery stall mid-stream.
+- In each cable pair's `VBCABLE_ControlPanel` (run as administrator), set `Options -> Set Max Latency` to a moderate value such as 2048-4096 smp and `Internal Sampling Rate` to 48000 Hz. Both require a reboot. Oversized or mismatched driver buffering shows up as periodic `AUDIBLE interruption` log entries on that cable's channel.
 
 ## Important Limitations
 
