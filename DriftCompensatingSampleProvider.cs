@@ -80,7 +80,7 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
         if (log is not null && now - lastStatsLogTicks >= StatsLogIntervalMs)
         {
             lastStatsLogTicks = now;
-            log($"{name} servo: backlog {smoothedBacklogMs:F0} ms, target {targetBacklogMs():F0} ms, rate correction {correction * 100:+0.00;-0.00}%");
+            log($"{name} servo: backlog {smoothedBacklogMs:F0} ms, target {targetBacklogMs():F0} ms, rate correction {correction * 100:+0.00;-0.00;+0.00}%");
         }
 
         var framesNeeded = resampler.ResamplePrepare(framesRequested, channels, out var inBuffer, out var inBufferOffset);

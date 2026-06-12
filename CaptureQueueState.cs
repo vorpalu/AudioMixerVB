@@ -12,9 +12,13 @@ public sealed class CaptureQueueState
 {
     private const double PeakDecayPerSecond = 0.98;
     private const double PacketMarginMs = 5;
+    private const double GapMarginMs = 10;
+    private const double MaxTrackedGapMs = 150;
 
     private readonly double baseTargetMs;
     private double peakPacketMs;
+    private double peakGapMs;
+    private long lastPacketTicks;
     private long lastDecayTicks = Environment.TickCount64;
 
     public CaptureQueueState(double baseTargetMs)
@@ -22,7 +26,9 @@ public sealed class CaptureQueueState
         this.baseTargetMs = baseTargetMs;
     }
 
-    public double EffectiveTargetMs => Math.Max(baseTargetMs, peakPacketMs + PacketMarginMs);
+    public double EffectiveTargetMs => Math.Max(
+        baseTargetMs,
+        Math.Max(peakPacketMs + PacketMarginMs, peakGapMs + GapMarginMs));
 
     public void OnPacket(double packetMs)
     {
@@ -30,7 +36,9 @@ public sealed class CaptureQueueState
         var elapsedSeconds = (now - lastDecayTicks) / 1000.0;
         if (elapsedSeconds > 0)
         {
-            peakPacketMs *= Math.Pow(PeakDecayPerSecond, elapsedSeconds);
+            var decay = Math.Pow(PeakDecayPerSecond, elapsedSeconds);
+            peakPacketMs *= decay;
+            peakGapMs *= decay;
             lastDecayTicks = now;
         }
 
@@ -38,5 +46,19 @@ public sealed class CaptureQueueState
         {
             peakPacketMs = packetMs;
         }
+
+        // Pauses between packets are delivery jitter the cushion must outlive.
+        // Anything longer is the stream going idle, which the dry-prefill
+        // already covers - buffering against it would only add latency.
+        if (lastPacketTicks != 0)
+        {
+            double gapMs = now - lastPacketTicks;
+            if (gapMs <= MaxTrackedGapMs && gapMs > peakGapMs)
+            {
+                peakGapMs = gapMs;
+            }
+        }
+
+        lastPacketTicks = now;
     }
 }
