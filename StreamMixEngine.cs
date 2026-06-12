@@ -269,6 +269,7 @@ public sealed class StreamMixEngine : IDisposable
                     // would need to rebuild the cushion at its capped rate.
                     if (bufferedProvider.BufferedBytes == 0)
                     {
+                        queueState.OnDry();
                         var prefillBytes = Math.Min(
                             (int)(queueState.EffectiveTargetMs * captureBytesPerMs),
                             trimBuffer.Length);
@@ -380,7 +381,9 @@ public sealed class StreamMixEngine : IDisposable
                 bufferedProvider,
                 dataAvailableHandler,
                 recordingStoppedHandler));
-            OnLog?.Invoke(this, $"Started stream capture for {channelName}: {captureDevice.FriendlyName}");
+            OnLog?.Invoke(
+                this,
+                $"Started stream capture for {channelName}: {captureDevice.FriendlyName} ({capture.WaveFormat.SampleRate} Hz, {capture.WaveFormat.Channels} ch)");
         }
 
         if (captureChannels.Count == 0)

@@ -14,11 +14,16 @@ public sealed class CaptureQueueState
     private const double PacketMarginMs = 5;
     private const double GapMarginMs = 10;
     private const double MaxTrackedGapMs = 150;
+    private const double ExtraCushionStepMs = 15;
+    private const double ExtraCushionMaxMs = 250;
+    private const int RepeatedDryWindowMs = 30000;
 
     private readonly double baseTargetMs;
     private double peakPacketMs;
     private double peakGapMs;
     private double peakReadMs;
+    private double extraCushionMs;
+    private long lastDryTicks;
     private long lastPacketTicks;
     private long lastDecayTicks = Environment.TickCount64;
 
@@ -34,7 +39,24 @@ public sealed class CaptureQueueState
     // seconds even though the average looks healthy.
     public double EffectiveTargetMs => Math.Max(
         baseTargetMs,
-        Math.Max(peakPacketMs + peakReadMs + PacketMarginMs, peakGapMs + GapMarginMs));
+        Math.Max(peakPacketMs + peakReadMs + PacketMarginMs, peakGapMs + GapMarginMs)) + extraCushionMs;
+
+    /// <summary>
+    /// Call when the queue runs dry. Repeated dries mean the source pump
+    /// stalls for longer than the cushion (and longer than the gap tracker
+    /// follows), so the channel buys itself extra cushion step by step until
+    /// its dries stop; the surcharge decays away while the cable behaves.
+    /// </summary>
+    public void OnDry()
+    {
+        var now = Environment.TickCount64;
+        if (lastDryTicks != 0 && now - lastDryTicks <= RepeatedDryWindowMs)
+        {
+            extraCushionMs = Math.Min(extraCushionMs + ExtraCushionStepMs, ExtraCushionMaxMs);
+        }
+
+        lastDryTicks = now;
+    }
 
     public void OnRead(double readMs)
     {
@@ -70,6 +92,7 @@ public sealed class CaptureQueueState
             var decay = Math.Pow(PeakDecayPerSecond, elapsedSeconds);
             peakPacketMs *= decay;
             peakGapMs *= decay;
+            extraCushionMs *= decay;
             lastDecayTicks = now;
         }
 
