@@ -16,5 +16,5 @@ public sealed class StreamMixSettings
 
     public Dictionary<string, bool> ChannelMutes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    public int LatencyMs { get; set; } = 60;
+    public int LatencyMs { get; set; } = 20;
 }

@@ -64,6 +64,26 @@ public sealed class UndocumentedAudioPolicyRouter
 
             foreach (var role in RolesToApply)
             {
+                // Writing the persisted endpoint makes audiosrv re-evaluate the app's
+                // active streams, which audibly glitches running captures. Read first
+                // and skip the write when the preference already matches the target.
+                var preCheckResult = TryVerifyRole(
+                    result,
+                    factory,
+                    processId,
+                    processName,
+                    targetEndpointId,
+                    targetEndpointFriendlyName,
+                    role);
+
+                result.DiagnosticMessages.AddRange(preCheckResult.DiagnosticMessages);
+                if (string.IsNullOrWhiteSpace(preCheckResult.ExceptionMessage) && preCheckResult.Success)
+                {
+                    verifiedRoles.Add(role.ToString());
+                    result.VerificationEndpointId = preCheckResult.VerificationEndpointId;
+                    continue;
+                }
+
                 var setRoleResult = TrySetRole(
                     result,
                     factory,

@@ -15,8 +15,11 @@ public partial class MainForm : Form
     private readonly SettingsService settingsService = new();
     private readonly SerialController serialController = new();
     private readonly Dictionary<string, ChannelControls> channelControlsByName = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, StreamChannelControls> streamChannelControlsByName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> lastAutoRoutingMessages = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, AutoRoutingAttempt> lastAutoRoutingAttempts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> channelAppChipSignatures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TimeSpan autoRefreshInterval = TimeSpan.FromSeconds(5);
+    private readonly TimeSpan autoRoutingCooldown = TimeSpan.FromSeconds(15);
     private readonly List<MixerChannel> channels;
 
     private AppSettings settings;
@@ -30,7 +33,12 @@ public partial class MainForm : Form
     private bool updatingSerialUi;
     private bool monitorOperationInProgress;
     private bool streamOperationInProgress;
+    private bool isRefreshingApps;
+    private bool isApplyingRouting;
+    private bool mixerDropTargetsRegistered;
     private bool allowCloseAfterAudioStop;
+    private DateTime lastRefreshAppsUtc = DateTime.MinValue;
+    private string unassignedAppChipSignature = "\u0000";
 
     private GroupBox monitorMixGroupBox = null!;
     private TableLayoutPanel monitorMixLayout = null!;
@@ -44,11 +52,11 @@ public partial class MainForm : Form
     private Button stopMonitorButton = null!;
     private Button restartMonitorButton = null!;
     private Label monitorStatusValueLabel = null!;
-    private Label monitorLatencyValueLabel = null!;
+    private NumericUpDown monitorLatencyNumericUpDown = null!;
+    private CheckBox monitorExclusiveCheckBox = null!;
     private Label monitorWarningLabel = null!;
     private GroupBox streamMixGroupBox = null!;
     private TableLayoutPanel streamMixLayout = null!;
-    private TableLayoutPanel streamChannelsTable = null!;
     private ComboBox streamOutputComboBox = null!;
     private Button startStreamButton = null!;
     private Button stopStreamButton = null!;
@@ -57,8 +65,10 @@ public partial class MainForm : Form
     private Label streamLatencyValueLabel = null!;
     private NumericUpDown streamLatencyNumericUpDown = null!;
     private Label streamWarningLabel = null!;
-    private ChannelStripControl streamMasterStripControl = null!;
-    private ChannelStripControl masterStripControl = null!;
+    private DualMixChannelStripControl masterStripControl = null!;
+    private Panel unassignedAppsContainerPanel = null!;
+    private FlowLayoutPanel unassignedAppsFlowPanel = null!;
+    private Label unassignedAppsTitleLabel = null!;
     private Button clearLogButton = null!;
     private Button copyLogButton = null!;
     private CheckBox autoScrollLogCheckBox = null!;
@@ -66,8 +76,8 @@ public partial class MainForm : Form
     public MainForm()
     {
         InitializeComponent();
-        audioEndpointController.LogMessage += (_, message) => AppendLog(message);
-        audioSessionController.LogMessage += (_, message) => AppendLog(message);
+        audioEndpointController.LogMessage += (_, message) => RunOnUiThread(() => AppendLog(message));
+        audioSessionController.LogMessage += (_, message) => RunOnUiThread(() => AppendLog(message));
         monitorMixEngine.OnLog += (_, message) => RunOnUiThread(() => AppendLog(message));
         monitorMixEngine.OnError += (_, ex) => RunOnUiThread(() => AppendLog($"Monitor error: {ex.Message}"));
         streamMixEngine.OnLog += (_, message) => RunOnUiThread(() => AppendLog(message));
@@ -80,6 +90,7 @@ public partial class MainForm : Form
         BuildStreamMixPanel();
         SetupAppSessionsGrid();
         LoadRoutingOptions();
+        BuildMixerUnassignedAppsPanel();
         BuildChannelPanels();
         BuildLogTools();
         SetMonitorButtons(isRunning: false, operationInProgress: false);
@@ -89,7 +100,11 @@ public partial class MainForm : Form
         LoadSerialSettings();
         RefreshComPorts();
         RefreshEndpoints(applyFirstRunAutoMapping: !settingsFileLoaded);
-        RefreshAppSessions();
+        Shown += async (_, _) =>
+        {
+            RegisterMixerDropTargets();
+            await RefreshAppSessionsAsync(logDetails: true, force: true, bindGrid: true);
+        };
         if (settings.MonitorMix.EnabledOnStartup)
         {
             StartMonitor();
@@ -177,19 +192,21 @@ public partial class MainForm : Form
         monitorMusicInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Music", monitorMusicInputComboBox);
         monitorMediaInputComboBox.SelectedIndexChanged += (_, _) => HandleMonitorInputChanged("Media", monitorMediaInputComboBox);
         channelSliderModeComboBox.SelectedIndexChanged += (_, _) => HandleChannelSliderModeChanged();
-        masterStripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleMonitorMasterGainChanged();
-        masterStripControl.MuteButton.Click += (_, _) => ToggleMonitorMasterMute();
+        masterStripControl.MonitorTrackBar.ValueChanged += (_, _) => HandleMonitorMasterGainChanged();
+        masterStripControl.MonitorMuteButton.Click += (_, _) => ToggleMonitorMasterMute();
+        masterStripControl.StreamTrackBar.ValueChanged += (_, _) => HandleMixerStreamMasterGainChanged();
+        masterStripControl.StreamMuteButton.Click += (_, _) => ToggleMixerStreamMasterMute();
+        monitorLatencyNumericUpDown.ValueChanged += (_, _) => HandleMonitorLatencyChanged();
+        monitorExclusiveCheckBox.CheckedChanged += (_, _) => HandleMonitorExclusiveChanged();
         startMonitorButton.Click += (_, _) => StartMonitor();
         stopMonitorButton.Click += async (_, _) => await StopMonitorAsync();
         restartMonitorButton.Click += async (_, _) => await RestartMonitorAsync();
         streamOutputComboBox.SelectedIndexChanged += (_, _) => HandleStreamOutputChanged();
         streamLatencyNumericUpDown.ValueChanged += (_, _) => HandleStreamLatencyChanged();
-        streamMasterStripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleStreamMasterGainChanged();
-        streamMasterStripControl.MuteButton.Click += (_, _) => ToggleStreamMasterMute();
         startStreamButton.Click += (_, _) => StartStreamMix();
         stopStreamButton.Click += async (_, _) => await StopStreamMixAsync();
         restartStreamButton.Click += async (_, _) => await RestartStreamMixAsync();
-        refreshAppsButton.Click += (_, _) => RefreshAppSessions();
+        refreshAppsButton.Click += async (_, _) => await RefreshAppSessionsAsync(logDetails: true, force: true, bindGrid: true);
         applyRoutingButton.Click += (_, _) => ApplyRouting(autoTriggered: false);
         saveRoutingRulesButton.Click += (_, _) => SaveRoutingRulesFromGrid(persist: true);
         clearRoutingButton.Click += (_, _) => ClearRoutingRules();
@@ -205,7 +222,7 @@ public partial class MainForm : Form
             autoApplyRoutingTimer.Enabled = settings.AutoApplyRoutingRules;
             SaveSettings();
         };
-        autoApplyRoutingTimer.Tick += (_, _) => ApplyRouting(autoTriggered: true);
+        autoApplyRoutingTimer.Tick += async (_, _) => await HandleAutoApplyTimerTickAsync();
         meterUpdateTimer.Tick += (_, _) => UpdateMeters();
         meterUpdateTimer.Start();
         showRawSessionsCheckBox.CheckedChanged += (_, _) => BindAppSessionsGrid();
@@ -230,6 +247,10 @@ public partial class MainForm : Form
                 appGroups = BuildAppGroups();
                 BindAppSessionsGrid();
                 UpdateChannelControlAvailability();
+                if (settings.AutoApplyRoutingRules)
+                {
+                    _ = AutoApplyPendingRoutesAsync();
+                }
             }
         };
         appSessionsGrid.DataError += (_, args) =>
@@ -294,7 +315,14 @@ public partial class MainForm : Form
         stopMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Stop", UseVisualStyleBackColor = true };
         restartMonitorButton = new Button { Dock = DockStyle.Fill, Text = "Restart", UseVisualStyleBackColor = true };
         monitorStatusValueLabel = new Label { Dock = DockStyle.Fill, Text = "Stopped", TextAlign = ContentAlignment.MiddleLeft };
-        monitorLatencyValueLabel = new Label { Dock = DockStyle.Fill, Text = $"{settings.MonitorMix.LatencyMs} ms", TextAlign = ContentAlignment.MiddleLeft };
+        monitorLatencyNumericUpDown = new NumericUpDown
+        {
+            Dock = DockStyle.Fill,
+            Minimum = 10,
+            Maximum = 500,
+            Increment = 5,
+            Value = Math.Clamp(settings.MonitorMix.LatencyMs, 10, 500)
+        };
         monitorWarningLabel = new Label
         {
             Dock = DockStyle.Fill,
@@ -305,7 +333,16 @@ public partial class MainForm : Form
         AddMonitorRow(0, "Output", monitorOutputComboBox, "Mode", channelSliderModeComboBox);
         AddMonitorRow(1, "Game", monitorGameInputComboBox, "Chat", monitorChatInputComboBox);
         AddMonitorRow(2, "Music", monitorMusicInputComboBox, "Media", monitorMediaInputComboBox);
-        AddMonitorRow(3, "Status", monitorStatusValueLabel, "Latency", monitorLatencyValueLabel);
+        AddMonitorRow(3, "Status", monitorStatusValueLabel, "Latency", monitorLatencyNumericUpDown);
+
+        monitorExclusiveCheckBox = new CheckBox
+        {
+            Dock = DockStyle.Fill,
+            Text = "Exclusive output (lowest latency, locks the device)",
+            Checked = settings.MonitorMix.ExclusiveOutput
+        };
+        monitorMixLayout.Controls.Add(monitorExclusiveCheckBox, 1, 4);
+        monitorMixLayout.SetColumnSpan(monitorExclusiveCheckBox, 3);
 
         monitorMixLayout.Controls.Add(startMonitorButton, 0, 6);
         monitorMixLayout.SetColumnSpan(startMonitorButton, 2);
@@ -335,11 +372,10 @@ public partial class MainForm : Form
         {
             ColumnCount = 1,
             Dock = DockStyle.Fill,
-            RowCount = 3
+            RowCount = 2
         };
         rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 124F));
-        rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 54F));
         rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
         streamMixLayout = new TableLayoutPanel
@@ -368,10 +404,10 @@ public partial class MainForm : Form
         streamLatencyNumericUpDown = new NumericUpDown
         {
             Dock = DockStyle.Fill,
-            Minimum = 20,
+            Minimum = 10,
             Maximum = 500,
             Increment = 5,
-            Value = settings.StreamMix.LatencyMs
+            Value = Math.Clamp(settings.StreamMix.LatencyMs, 10, 500)
         };
         streamWarningLabel = new Label
         {
@@ -389,39 +425,6 @@ public partial class MainForm : Form
 
         rootLayout.Controls.Add(streamMixLayout, 0, 0);
         rootLayout.Controls.Add(streamWarningLabel, 0, 1);
-
-        streamChannelsTable = new TableLayoutPanel
-        {
-            ColumnCount = StreamChannelNames.Length + 1,
-            Dock = DockStyle.Fill,
-            RowCount = 1
-        };
-        streamChannelsTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-        for (var column = 0; column < streamChannelsTable.ColumnCount; column++)
-        {
-            streamChannelsTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F / streamChannelsTable.ColumnCount));
-        }
-
-        streamMasterStripControl = new ChannelStripControl
-        {
-            ChannelName = "Stream Master",
-            AccentColor = Color.FromArgb(86, 169, 255),
-            EndpointComboBoxVisible = false,
-            VolumePercent = GainToPercent(settings.StreamMix.MasterGain),
-            IsMuted = settings.StreamMix.MasterMuted
-        };
-        streamMasterStripControl.SetEndpointControlsEnabled(enabled: true);
-        streamMasterStripControl.SetStatus("No output", Color.FromArgb(190, 196, 205));
-        streamChannelsTable.Controls.Add(streamMasterStripControl, 0, 0);
-
-        for (var index = 0; index < StreamChannelNames.Length; index++)
-        {
-            var controls = CreateStreamChannelControls(StreamChannelNames[index]);
-            streamChannelControlsByName[controls.ChannelName] = controls;
-            streamChannelsTable.Controls.Add(controls.StripControl, index + 1, 0);
-        }
-
-        rootLayout.Controls.Add(streamChannelsTable, 0, 2);
         streamMixGroupBox.Controls.Add(rootLayout);
         streamTabPage.Controls.Add(streamMixGroupBox);
         streamTabPage.ResumeLayout();
@@ -449,26 +452,6 @@ public partial class MainForm : Form
             TextAlign = ContentAlignment.MiddleLeft
         }, 4, row);
         streamMixLayout.Controls.Add(rightControl, 5, row);
-    }
-
-    private StreamChannelControls CreateStreamChannelControls(string channelName)
-    {
-        var stripControl = new ChannelStripControl
-        {
-            ChannelName = channelName,
-            AccentColor = GetChannelAccentColor(channelName),
-            EndpointComboBoxVisible = false,
-            VolumePercent = GainToPercent(settings.StreamMix.ChannelGains.GetValueOrDefault(channelName, 1.0f)),
-            IsMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(channelName)
-        };
-        stripControl.SetEndpointControlsEnabled(enabled: true);
-        stripControl.SetStatus("No input", Color.FromArgb(190, 196, 205));
-
-        var controls = new StreamChannelControls(channelName, stripControl);
-        stripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleStreamChannelGainChanged(controls);
-        stripControl.MuteButton.Click += (_, _) => ToggleStreamChannelMute(controls);
-
-        return controls;
     }
 
     private static ComboBox CreateMonitorComboBox()
@@ -574,7 +557,7 @@ public partial class MainForm : Form
 
     private static void ApplyDarkTheme(Control control)
     {
-        if (control is ChannelStripControl)
+        if (control is ChannelStripControl or DualMixChannelStripControl or AppChipControl)
         {
             return;
         }
@@ -627,10 +610,68 @@ public partial class MainForm : Form
         }
     }
 
+    private void BuildMixerUnassignedAppsPanel()
+    {
+        channelsContainer.SuspendLayout();
+        channelsContainer.Controls.Remove(channelsTable);
+        channelsContainer.RowStyles.Clear();
+        channelsContainer.RowCount = 3;
+        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
+        channelsContainer.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        unassignedAppsContainerPanel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(3),
+            Padding = new Padding(8),
+            BackColor = Color.FromArgb(32, 36, 43)
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            ColumnCount = 2,
+            Dock = DockStyle.Fill,
+            RowCount = 1,
+            BackColor = Color.FromArgb(32, 36, 43)
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126F));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        unassignedAppsTitleLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(242, 244, 248),
+            Text = "Unassigned Apps",
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        unassignedAppsFlowPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Color.FromArgb(24, 27, 33),
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            AutoScroll = true,
+            Padding = new Padding(4)
+        };
+
+        layout.Controls.Add(unassignedAppsTitleLabel, 0, 0);
+        layout.Controls.Add(unassignedAppsFlowPanel, 1, 0);
+        unassignedAppsContainerPanel.Controls.Add(layout);
+
+        channelsContainer.Controls.Add(unassignedAppsContainerPanel, 0, 1);
+        channelsContainer.Controls.Add(channelsTable, 0, 2);
+        channelsContainer.ResumeLayout();
+    }
+
     private void BuildChannelPanels()
     {
         channelsTable.SuspendLayout();
         channelsTable.Controls.Clear();
+        channelControlsByName.Clear();
         channelsTable.ColumnStyles.Clear();
         channelsTable.RowStyles.Clear();
         channelsTable.ColumnCount = channels.Count + 1;
@@ -642,16 +683,18 @@ public partial class MainForm : Form
             channelsTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F / channelsTable.ColumnCount));
         }
 
-        masterStripControl = new ChannelStripControl
+        masterStripControl = new DualMixChannelStripControl
         {
-            ChannelName = "Monitor Master",
+            ChannelName = "Master",
+            IconText = "MASTER",
             AccentColor = Color.FromArgb(86, 169, 255),
-            EndpointComboBoxVisible = false,
-            VolumePercent = GainToPercent(settings.MonitorMix.MasterGain),
-            IsMuted = settings.MonitorMix.MasterMuted
+            MonitorPercent = GainToPercent(settings.MonitorMix.MasterGain),
+            StreamPercent = GainToPercent(settings.StreamMix.MasterGain),
+            MonitorMuted = settings.MonitorMix.MasterMuted,
+            StreamMuted = settings.StreamMix.MasterMuted,
+            EndpointComboBoxVisible = false
         };
-        masterStripControl.SetEndpointControlsEnabled(enabled: true);
-        masterStripControl.SetStatus("No output", Color.FromArgb(190, 196, 205));
+        masterStripControl.SetMixControlsEnabled(enabled: true);
         channelsTable.Controls.Add(masterStripControl, 0, 0);
 
         for (var index = 0; index < channels.Count; index++)
@@ -660,30 +703,175 @@ public partial class MainForm : Form
             var controls = CreateChannelControls(channel);
             channelControlsByName[channel.Name] = controls;
 
-            controls.StripControl.AccentColor = GetChannelAccentColor(channel.Name);
             channelsTable.Controls.Add(controls.StripControl, index + 1, 0);
         }
 
         UpdateMasterStripSummary();
+        UpdateMixerAppSummaries();
         channelsTable.ResumeLayout();
     }
 
     private ChannelControls CreateChannelControls(MixerChannel channel)
     {
-        var stripControl = new ChannelStripControl
+        var stripControl = new DualMixChannelStripControl
         {
             ChannelName = channel.Name,
-            VolumePercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(channel.Name, 0.5f)),
-            IsMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(channel.Name)
+            IconText = GetChannelIconText(channel.Name),
+            AccentColor = GetChannelAccentColor(channel.Name),
+            MonitorPercent = GainToPercent(settings.MonitorMix.ChannelGains.GetValueOrDefault(channel.Name, 0.5f)),
+            StreamPercent = GainToPercent(settings.StreamMix.ChannelGains.GetValueOrDefault(channel.Name, 1.0f)),
+            MonitorMuted = settings.MonitorMix.ChannelMutes.GetValueOrDefault(channel.Name),
+            StreamMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(channel.Name),
+            EndpointComboBoxVisible = true
         };
+        stripControl.SetMixControlsEnabled(enabled: true);
 
         var controls = new ChannelControls(channel, stripControl);
 
         stripControl.EndpointComboBox.SelectedIndexChanged += (_, _) => HandleEndpointSelectionChanged(controls);
-        stripControl.VolumeTrackBar.ValueChanged += (_, _) => HandleVolumeChanged(controls);
-        stripControl.MuteButton.Click += (_, _) => ToggleChannelMute(controls);
-
+        stripControl.MonitorTrackBar.ValueChanged += (_, _) => HandleVolumeChanged(controls);
+        stripControl.MonitorMuteButton.Click += (_, _) => ToggleChannelMute(controls);
+        stripControl.StreamTrackBar.ValueChanged += (_, _) => HandleMixerStreamVolumeChanged(controls);
+        stripControl.StreamMuteButton.Click += (_, _) => ToggleMixerStreamMute(controls);
         return controls;
+    }
+
+    private void RegisterMixerDropTargets()
+    {
+        if (mixerDropTargetsRegistered)
+        {
+            return;
+        }
+
+        RegisterUnassignedDropTarget(unassignedAppsContainerPanel);
+        RegisterUnassignedDropTarget(unassignedAppsFlowPanel);
+        RegisterUnassignedDropTarget(unassignedAppsTitleLabel);
+        RegisterUnassignedDropTargetForChildren(unassignedAppsContainerPanel);
+
+        foreach (var controls in channelControlsByName.Values)
+        {
+            RegisterChannelDropTarget(controls.StripControl.AppDropArea, controls.Channel.Name);
+            RegisterChannelDropTarget(controls.StripControl.AppChipsPanel, controls.Channel.Name);
+            RegisterChannelDropTargetForChildren(controls.StripControl.AppChipsPanel, controls.Channel.Name);
+        }
+
+        mixerDropTargetsRegistered = true;
+    }
+
+    private void RegisterChannelDropTarget(Control target, string channelName)
+    {
+        target.AllowDrop = true;
+        target.DragEnter += (_, args) => HandleChannelDragOver(args, channelName);
+        target.DragOver += (_, args) => HandleChannelDragOver(args, channelName);
+        target.DragLeave += (_, _) => SetChannelDropHighlight(channelName, highlighted: false);
+        target.DragDrop += (_, args) =>
+        {
+            SetChannelDropHighlight(channelName, highlighted: false);
+            if (TryGetDraggedApp(args, out var draggedApp))
+            {
+                AssignAppFromMixer(draggedApp.ProcessName, channelName);
+            }
+        };
+
+    }
+
+    private void RegisterChannelDropTargetForChildren(Control control, string channelName)
+    {
+        foreach (Control child in control.Controls)
+        {
+            RegisterChannelDropTarget(child, channelName);
+            RegisterChannelDropTargetForChildren(child, channelName);
+        }
+    }
+
+    private void RegisterUnassignedDropTarget(Control target)
+    {
+        target.AllowDrop = true;
+        target.DragEnter += (_, args) => HandleUnassignedDragOver(args);
+        target.DragOver += (_, args) => HandleUnassignedDragOver(args);
+        target.DragLeave += (_, _) => SetUnassignedDropHighlight(highlighted: false);
+        target.DragDrop += (_, args) =>
+        {
+            SetUnassignedDropHighlight(highlighted: false);
+            if (TryGetDraggedApp(args, out var draggedApp))
+            {
+                AssignAppFromMixer(draggedApp.ProcessName, channelName: null);
+            }
+        };
+    }
+
+    private void HandleChannelDragOver(DragEventArgs args, string channelName)
+    {
+        if (!TryGetDraggedApp(args, out _))
+        {
+            args.Effect = DragDropEffects.None;
+            SetChannelDropHighlight(channelName, highlighted: false);
+            return;
+        }
+
+        args.Effect = DragDropEffects.Move;
+        SetChannelDropHighlight(channelName, highlighted: true);
+    }
+
+    private void HandleUnassignedDragOver(DragEventArgs args)
+    {
+        if (!TryGetDraggedApp(args, out _))
+        {
+            args.Effect = DragDropEffects.None;
+            SetUnassignedDropHighlight(highlighted: false);
+            return;
+        }
+
+        args.Effect = DragDropEffects.Move;
+        SetUnassignedDropHighlight(highlighted: true);
+    }
+
+    private static bool TryGetDraggedApp(DragEventArgs args, out AppChipDragData draggedApp)
+    {
+        draggedApp = null!;
+        if (args.Data is null || !args.Data.GetDataPresent(typeof(AppChipDragData)))
+        {
+            return false;
+        }
+
+        draggedApp = args.Data.GetData(typeof(AppChipDragData)) as AppChipDragData ?? null!;
+        return draggedApp is not null && !string.IsNullOrWhiteSpace(draggedApp.ProcessName);
+    }
+
+    private void SetChannelDropHighlight(string channelName, bool highlighted)
+    {
+        if (channelControlsByName.TryGetValue(channelName, out var controls))
+        {
+            controls.StripControl.SetDropHighlight(highlighted);
+        }
+    }
+
+    private void SetUnassignedDropHighlight(bool highlighted)
+    {
+        if (unassignedAppsContainerPanel is null || unassignedAppsFlowPanel is null)
+        {
+            return;
+        }
+
+        var color = highlighted
+            ? Color.FromArgb(37, 42, 51)
+            : Color.FromArgb(32, 36, 43);
+        unassignedAppsContainerPanel.BackColor = color;
+        unassignedAppsFlowPanel.BackColor = highlighted
+            ? Color.FromArgb(37, 42, 51)
+            : Color.FromArgb(24, 27, 33);
+    }
+
+    private static string GetChannelIconText(string channelName)
+    {
+        return channelName.ToUpperInvariant() switch
+        {
+            "GAME" => "GAME",
+            "CHAT" => "CHAT",
+            "MEDIA" => "MEDIA",
+            "MUSIC" => "MUSIC",
+            _ => "CH"
+        };
     }
 
     private static Color GetChannelAccentColor(string channelName)
@@ -706,34 +894,26 @@ public partial class MainForm : Form
         }
 
         var output = FindMonitorOutputEndpoint();
-        masterStripControl.SetStatus(
-            output?.FriendlyName ?? "No output",
-            output is null ? Color.FromArgb(190, 196, 205) : Color.FromArgb(130, 210, 255));
+        var streamOutput = FindStreamOutputEndpoint();
+        masterStripControl.AppSummary =
+            $"Monitor: {output?.FriendlyName ?? "No output"}{Environment.NewLine}Stream: {streamOutput?.FriendlyName ?? "No output"}";
     }
 
     private void UpdateMeters()
     {
         if (masterStripControl is not null)
         {
-            masterStripControl.VuMeter.Value = PeakToPercent(monitorMixEngine.GetMasterPeak());
+            masterStripControl.MonitorVuMeter.Value = PeakToPercent(monitorMixEngine.GetMasterPeak());
+            masterStripControl.StreamVuMeter.Value = PeakToPercent(streamMixEngine.GetMasterPeak());
         }
 
         var peaks = monitorMixEngine.GetChannelPeaks();
         foreach (var controls in channelControlsByName.Values)
         {
-            controls.StripControl.VuMeter.Value = peaks.TryGetValue(controls.Channel.Name, out var peak)
+            controls.StripControl.MonitorVuMeter.Value = peaks.TryGetValue(controls.Channel.Name, out var peak)
                 ? PeakToPercent(peak)
                 : 0;
-        }
-
-        if (streamMasterStripControl is not null)
-        {
-            streamMasterStripControl.VuMeter.Value = PeakToPercent(streamMixEngine.GetMasterPeak());
-        }
-
-        foreach (var controls in streamChannelControlsByName.Values)
-        {
-            controls.StripControl.VuMeter.Value = PeakToPercent(streamMixEngine.GetChannelPeak(controls.ChannelName));
+            controls.StripControl.StreamVuMeter.Value = PeakToPercent(streamMixEngine.GetChannelPeak(controls.Channel.Name));
         }
     }
 
@@ -883,21 +1063,22 @@ public partial class MainForm : Form
         foreach (var controls in channelControlsByName.Values)
         {
             controls.IsUpdating = true;
-            controls.EndpointComboBox.BeginUpdate();
-            controls.EndpointComboBox.Items.Clear();
-            controls.EndpointComboBox.Items.Add(EndpointChoice.Empty);
+            var comboBox = controls.StripControl.EndpointComboBox;
+            comboBox.BeginUpdate();
+            comboBox.Items.Clear();
+            comboBox.Items.Add(EndpointChoice.Empty);
 
             foreach (var endpoint in endpoints)
             {
-                controls.EndpointComboBox.Items.Add(new EndpointChoice(endpoint));
+                comboBox.Items.Add(new EndpointChoice(endpoint));
             }
 
             var selectedEndpoint = FindSelectedEndpoint(controls.Channel);
-            controls.EndpointComboBox.SelectedItem = selectedEndpoint is null
+            comboBox.SelectedItem = selectedEndpoint is null
                 ? EndpointChoice.Empty
-                : FindChoice(controls.EndpointComboBox, selectedEndpoint.Id);
-
-            controls.EndpointComboBox.EndUpdate();
+                : FindChoice(comboBox, selectedEndpoint.Id) ?? EndpointChoice.Empty;
+            comboBox.DropDownWidth = Math.Max(comboBox.DropDownWidth, 360);
+            comboBox.EndUpdate();
             controls.IsUpdating = false;
 
             if (selectedEndpoint is null)
@@ -922,7 +1103,8 @@ public partial class MainForm : Form
         PopulateMonitorInputComboBox(monitorMediaInputComboBox, "Media");
 
         channelSliderModeComboBox.SelectedItem = NormalizeSliderMode(settings.MonitorMix.ChannelSliderMode);
-        monitorLatencyValueLabel.Text = $"{settings.MonitorMix.LatencyMs} ms";
+        monitorLatencyNumericUpDown.Value = Math.Clamp(settings.MonitorMix.LatencyMs, 10, 500);
+        monitorExclusiveCheckBox.Checked = settings.MonitorMix.ExclusiveOutput;
         SyncMonitorMixControlsFromSettings();
         updatingMonitorUi = false;
 
@@ -933,8 +1115,8 @@ public partial class MainForm : Form
 
     private void SyncMonitorMixControlsFromSettings()
     {
-        masterStripControl.VolumePercent = GainToPercent(settings.MonitorMix.MasterGain);
-        masterStripControl.IsMuted = settings.MonitorMix.MasterMuted;
+        masterStripControl.MonitorPercent = GainToPercent(settings.MonitorMix.MasterGain);
+        masterStripControl.MonitorMuted = settings.MonitorMix.MasterMuted;
 
         foreach (var controls in channelControlsByName.Values)
         {
@@ -1037,17 +1219,17 @@ public partial class MainForm : Form
     {
         updatingStreamUi = true;
         PopulateStreamOutputComboBox();
-        streamLatencyNumericUpDown.Value = Math.Clamp(settings.StreamMix.LatencyMs, 20, 500);
+        streamLatencyNumericUpDown.Value = Math.Clamp(settings.StreamMix.LatencyMs, 10, 500);
         streamLatencyValueLabel.Text = $"{settings.StreamMix.LatencyMs} ms";
-        streamMasterStripControl.VolumePercent = GainToPercent(settings.StreamMix.MasterGain);
-        streamMasterStripControl.IsMuted = settings.StreamMix.MasterMuted;
+        masterStripControl.StreamPercent = GainToPercent(settings.StreamMix.MasterGain);
+        masterStripControl.StreamMuted = settings.StreamMix.MasterMuted;
 
-        foreach (var controls in streamChannelControlsByName.Values)
+        foreach (var controls in channelControlsByName.Values)
         {
             controls.IsUpdating = true;
-            controls.StripControl.VolumePercent = GainToPercent(
-                settings.StreamMix.ChannelGains.GetValueOrDefault(controls.ChannelName, 1.0f));
-            controls.StripControl.IsMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.ChannelName);
+            controls.StripControl.StreamPercent = GainToPercent(
+                settings.StreamMix.ChannelGains.GetValueOrDefault(controls.Channel.Name, 1.0f));
+            controls.StripControl.StreamMuted = settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
             controls.IsUpdating = false;
         }
 
@@ -1056,7 +1238,6 @@ public partial class MainForm : Form
         ApplyStreamSettingsToEngine();
         UpdateStreamWarning();
         UpdateStreamMasterStripSummary();
-        UpdateStreamCaptureDisplays();
     }
 
     private void PopulateStreamOutputComboBox()
@@ -1159,7 +1340,7 @@ public partial class MainForm : Form
             return;
         }
 
-        var volumePercent = masterStripControl.VolumeTrackBar.Value;
+        var volumePercent = masterStripControl.MonitorTrackBar.Value;
         settings.MonitorMix.MasterGain = volumePercent / 100f;
         SetMonitorMasterVolumeUiValue(volumePercent);
         monitorMixEngine.SetMasterGain(settings.MonitorMix.MasterGain);
@@ -1191,18 +1372,19 @@ public partial class MainForm : Form
     private void SetMonitorMasterVolumeUiValue(int volumePercent)
     {
         updatingMonitorUi = true;
-        masterStripControl.VolumePercent = volumePercent;
+        masterStripControl.MonitorPercent = volumePercent;
         updatingMonitorUi = false;
     }
 
     private void SetMonitorMasterMuteUiValue(bool isMuted)
     {
-        masterStripControl.IsMuted = isMuted;
+        masterStripControl.MonitorMuted = isMuted;
     }
 
     private void ApplyMonitorSettingsToEngine()
     {
         monitorMixEngine.LatencyMs = settings.MonitorMix.LatencyMs;
+        monitorMixEngine.UseExclusiveOutput = settings.MonitorMix.ExclusiveOutput;
 
         monitorMixEngine.SetOutputDevice(settings.MonitorMix.OutputEndpointId ?? string.Empty);
 
@@ -1367,11 +1549,46 @@ public partial class MainForm : Form
         ApplyStreamSettingsToEngine();
         UpdateStreamWarning();
         UpdateStreamMasterStripSummary();
+        UpdateMasterStripSummary();
         SaveSettings();
 
         if (endpoint is not null)
         {
             AppendLog($"Stream output = {endpoint.FriendlyName}");
+        }
+    }
+
+    private void HandleMonitorLatencyChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        settings.MonitorMix.LatencyMs = (int)monitorLatencyNumericUpDown.Value;
+        monitorMixEngine.LatencyMs = settings.MonitorMix.LatencyMs;
+        SaveSettings();
+
+        if (monitorMixEngine.IsRunning)
+        {
+            AppendLog("Monitor latency updated. Restart Monitor to apply it to the active WASAPI output.");
+        }
+    }
+
+    private void HandleMonitorExclusiveChanged()
+    {
+        if (updatingMonitorUi)
+        {
+            return;
+        }
+
+        settings.MonitorMix.ExclusiveOutput = monitorExclusiveCheckBox.Checked;
+        monitorMixEngine.UseExclusiveOutput = settings.MonitorMix.ExclusiveOutput;
+        SaveSettings();
+
+        if (monitorMixEngine.IsRunning)
+        {
+            AppendLog("Monitor output mode updated. Restart Monitor to apply it.");
         }
     }
 
@@ -1393,59 +1610,65 @@ public partial class MainForm : Form
         }
     }
 
-    private void HandleStreamMasterGainChanged()
+    private void ApplyStreamMasterGain(int volumePercent)
+    {
+        volumePercent = Math.Clamp(volumePercent, 0, 100);
+        settings.StreamMix.MasterGain = volumePercent / 100f;
+        SetMixerStreamMasterVolumeUiValue(volumePercent);
+        streamMixEngine.SetMasterGain(settings.StreamMix.MasterGain);
+        SaveSettings();
+        AppendLog($"Stream master gain = {volumePercent}%");
+    }
+
+    private void HandleMixerStreamMasterGainChanged()
     {
         if (updatingStreamUi)
         {
             return;
         }
 
-        var volumePercent = streamMasterStripControl.VolumeTrackBar.Value;
-        settings.StreamMix.MasterGain = volumePercent / 100f;
-        SetStreamMasterVolumeUiValue(volumePercent);
-        streamMixEngine.SetMasterGain(settings.StreamMix.MasterGain);
-        SaveSettings();
-        AppendLog($"Stream master gain = {volumePercent}%");
+        var volumePercent = masterStripControl.StreamTrackBar.Value;
+        ApplyStreamMasterGain(volumePercent);
     }
 
-    private void ToggleStreamMasterMute()
+    private void ToggleMixerStreamMasterMute()
     {
         settings.StreamMix.MasterMuted = !settings.StreamMix.MasterMuted;
         streamMixEngine.SetMasterMute(settings.StreamMix.MasterMuted);
-        SetStreamMasterMuteUiValue(settings.StreamMix.MasterMuted);
+        SetMixerStreamMasterMuteUiValue(settings.StreamMix.MasterMuted);
         SaveSettings();
         AppendLog($"Stream master mute = {(settings.StreamMix.MasterMuted ? "on" : "off")}");
     }
 
-    private void HandleStreamChannelGainChanged(StreamChannelControls controls)
+    private void HandleMixerStreamVolumeChanged(ChannelControls controls)
     {
-        if (updatingStreamUi || controls.IsUpdating)
+        if (controls.IsUpdating)
         {
             return;
         }
 
-        ApplyStreamChannelGain(controls, controls.StripControl.VolumeTrackBar.Value);
+        ApplyStreamChannelGain(controls.Channel.Name, controls.StripControl.StreamTrackBar.Value);
     }
 
-    private void ApplyStreamChannelGain(StreamChannelControls controls, int volumePercent)
+    private void ApplyStreamChannelGain(string channelName, int volumePercent)
     {
         volumePercent = Math.Clamp(volumePercent, 0, 100);
         var gain = volumePercent / 100f;
-        settings.StreamMix.ChannelGains[controls.ChannelName] = gain;
-        SetStreamChannelVolumeUiValue(controls, volumePercent);
-        streamMixEngine.SetChannelGain(controls.ChannelName, gain);
+        settings.StreamMix.ChannelGains[channelName] = gain;
+        SetMixerStreamChannelVolumeUiValue(channelName, volumePercent);
+        streamMixEngine.SetChannelGain(channelName, gain);
         SaveSettings();
-        AppendLog($"{controls.ChannelName} stream gain = {volumePercent}%");
+        AppendLog($"{channelName} stream gain = {volumePercent}%");
     }
 
-    private void ToggleStreamChannelMute(StreamChannelControls controls)
+    private void ToggleMixerStreamMute(ChannelControls controls)
     {
-        var isMuted = !settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.ChannelName);
-        settings.StreamMix.ChannelMutes[controls.ChannelName] = isMuted;
-        streamMixEngine.SetChannelMute(controls.ChannelName, isMuted);
-        SetStreamChannelMuteUiValue(controls, isMuted);
+        var isMuted = !settings.StreamMix.ChannelMutes.GetValueOrDefault(controls.Channel.Name);
+        settings.StreamMix.ChannelMutes[controls.Channel.Name] = isMuted;
+        streamMixEngine.SetChannelMute(controls.Channel.Name, isMuted);
+        SetMixerStreamChannelMuteUiValue(controls.Channel.Name, isMuted);
         SaveSettings();
-        AppendLog($"{controls.ChannelName} stream mute = {(isMuted ? "on" : "off")}");
+        AppendLog($"{controls.Channel.Name} stream mute = {(isMuted ? "on" : "off")}");
     }
 
     private void ApplyStreamSettingsToEngine()
@@ -1636,45 +1859,41 @@ public partial class MainForm : Form
 
     private void UpdateStreamMasterStripSummary()
     {
-        var output = FindStreamOutputEndpoint();
-        streamMasterStripControl.SetStatus(
-            output?.FriendlyName ?? "No output",
-            output is null ? Color.FromArgb(190, 196, 205) : Color.FromArgb(130, 210, 255));
+        UpdateMasterStripSummary();
     }
 
-    private void UpdateStreamCaptureDisplays()
-    {
-        foreach (var controls in streamChannelControlsByName.Values)
-        {
-            var input = FindStreamCaptureEndpoint(controls.ChannelName);
-            controls.StripControl.SetStatus(
-                input?.FriendlyName ?? "Input not found",
-                input is null ? Color.Firebrick : Color.FromArgb(130, 210, 255));
-        }
-    }
-
-    private void SetStreamMasterVolumeUiValue(int volumePercent)
+    private void SetMixerStreamMasterVolumeUiValue(int volumePercent)
     {
         updatingStreamUi = true;
-        streamMasterStripControl.VolumePercent = volumePercent;
+        masterStripControl.StreamPercent = volumePercent;
         updatingStreamUi = false;
     }
 
-    private void SetStreamMasterMuteUiValue(bool isMuted)
+    private void SetMixerStreamMasterMuteUiValue(bool isMuted)
     {
-        streamMasterStripControl.IsMuted = isMuted;
+        masterStripControl.StreamMuted = isMuted;
     }
 
-    private static void SetStreamChannelVolumeUiValue(StreamChannelControls controls, int volumePercent)
+    private void SetMixerStreamChannelVolumeUiValue(string channelName, int volumePercent)
     {
+        if (!channelControlsByName.TryGetValue(channelName, out var controls))
+        {
+            return;
+        }
+
         controls.IsUpdating = true;
-        controls.StripControl.VolumePercent = volumePercent;
+        controls.StripControl.StreamPercent = volumePercent;
         controls.IsUpdating = false;
     }
 
-    private static void SetStreamChannelMuteUiValue(StreamChannelControls controls, bool isMuted)
+    private void SetMixerStreamChannelMuteUiValue(string channelName, bool isMuted)
     {
-        controls.StripControl.IsMuted = isMuted;
+        if (!channelControlsByName.TryGetValue(channelName, out var controls))
+        {
+            return;
+        }
+
+        controls.StripControl.StreamMuted = isMuted;
     }
 
     private static bool IsVbCableEndpoint(AudioEndpoint endpoint)
@@ -1739,20 +1958,30 @@ public partial class MainForm : Form
             return;
         }
 
-        if (controls.EndpointComboBox.SelectedItem is not EndpointChoice choice || choice.Endpoint is null)
+        var endpoint = (controls.StripControl.EndpointComboBox.SelectedItem as EndpointChoice)?.Endpoint;
+        controls.Channel.SelectedEndpointId = endpoint?.Id;
+        controls.Channel.SelectedEndpointName = endpoint?.FriendlyName;
+
+        if (endpoint is null)
         {
-            controls.Channel.SelectedEndpointId = null;
-            controls.Channel.SelectedEndpointName = null;
             MarkEndpointUnavailable(controls, "Not found");
-            SaveSettings();
-            return;
+            AppendLog($"{controls.Channel.Name} routing endpoint cleared.");
+        }
+        else
+        {
+            SyncChannelFromEndpoint(controls, logErrors: false);
+            AppendLog($"{controls.Channel.Name} routing endpoint = {endpoint.FriendlyName}");
         }
 
-        controls.Channel.SelectedEndpointId = choice.Endpoint.Id;
-        controls.Channel.SelectedEndpointName = choice.Endpoint.FriendlyName;
-        AppendLog($"{controls.Channel.Name} endpoint = {choice.Endpoint.FriendlyName}");
-        SyncChannelFromEndpoint(controls, logErrors: true);
+        SaveRoutingRulesFromGrid(persist: false);
+        BindAppSessionsGrid();
+        UpdateChannelControlAvailability();
         SaveSettings();
+
+        if (settings.AutoApplyRoutingRules)
+        {
+            _ = AutoApplyPendingRoutesAsync();
+        }
     }
 
     private void SyncChannelFromEndpoint(ChannelControls controls, bool logErrors)
@@ -1794,12 +2023,12 @@ public partial class MainForm : Form
 
     private void HandleVolumeChanged(ChannelControls controls)
     {
-        if (controls.IsUpdating || !controls.VolumeTrackBar.Enabled)
+        if (controls.IsUpdating || !controls.StripControl.MonitorTrackBar.Enabled)
         {
             return;
         }
 
-        ApplyChannelVolume(controls, controls.VolumeTrackBar.Value);
+        ApplyChannelVolume(controls, controls.StripControl.MonitorTrackBar.Value);
     }
 
     private void ApplyChannelVolume(ChannelControls controls, int volumePercent)
@@ -1860,7 +2089,8 @@ public partial class MainForm : Form
 
     private static void SetEndpointControlsEnabled(ChannelControls controls, bool enabled)
     {
-        controls.StripControl.SetEndpointControlsEnabled(enabled);
+        controls.StripControl.SetMixControlsEnabled(enabled);
+        controls.StripControl.SetEndpointSelectorEnabled(enabled);
     }
 
     private void MarkEndpointUnavailable(ChannelControls controls, string status)
@@ -1872,33 +2102,27 @@ public partial class MainForm : Form
     private static void SetVolumeUiValue(ChannelControls controls, int volumePercent)
     {
         controls.IsUpdating = true;
-        controls.StripControl.VolumePercent = volumePercent;
+        controls.StripControl.MonitorPercent = volumePercent;
         controls.IsUpdating = false;
     }
 
     private static void SetMuteUiValue(ChannelControls controls, bool isMuted)
     {
-        controls.StripControl.IsMuted = isMuted;
+        controls.StripControl.MonitorMuted = isMuted;
     }
 
     private static void SetStatus(ChannelControls controls, string status)
     {
-        var color = status switch
-        {
-            "Found" => Color.ForestGreen,
-            "Muted" => Color.DarkOrange,
-            "Error" => Color.Firebrick,
-            "Apps" => Color.RoyalBlue,
-            _ => Color.DimGray
-        };
-
-        controls.StripControl.SetStatus(status, color);
+        controls.StripControl.EndpointComboBox.BackColor = status is "Error" or "Not found"
+            ? Color.FromArgb(64, 31, 36)
+            : Color.FromArgb(24, 27, 33);
     }
 
     private void LoadRoutingOptions()
     {
         enableExperimentalRoutingCheckBox.Checked = settings.EnableExperimentalAutomaticRouting;
         autoApplyRoutingRulesCheckBox.Checked = settings.AutoApplyRoutingRules;
+        autoApplyRoutingTimer.Interval = (int)autoRefreshInterval.TotalMilliseconds;
         autoApplyRoutingTimer.Enabled = settings.AutoApplyRoutingRules;
     }
 
@@ -1980,36 +2204,210 @@ public partial class MainForm : Form
 
     private void RefreshAppSessions(bool logDetails = true)
     {
+        if (isRefreshingApps)
+        {
+            AppendLog("Refresh apps skipped: already running.");
+            return;
+        }
+
+        isRefreshingApps = true;
         try
         {
-            appSessions = audioSessionController.GetAudioSessions(endpoints);
-            AssignChannelsToSessions();
-            appGroups = BuildAppGroups();
-            BindAppSessionsGrid();
-            UpdateChannelControlAvailability();
-
             if (logDetails)
             {
-                AppendLog($"Found {appSessions.Count} active audio app session(s) across {appGroups.Count} app group(s).");
-                foreach (var group in appGroups)
-                {
-                    AppendLog(
-                        $"App group: {group.ProcessName}, PIDs = {FormatProcessIds(group.ProcessIds)}, sessions = {group.SessionCount}, endpoints = {group.CurrentEndpointsSummary}, target = {group.TargetEndpointFriendlyName}, volume = {group.VolumePercent}%, channel = {group.AssignedChannel}, status = {group.Status}");
-                }
+                AppendLog("Refresh apps started.");
             }
+
+            var refreshedSessions = audioSessionController.GetAudioSessions(endpoints);
+            ApplyRefreshedAppSessions(refreshedSessions, logDetails, bindGrid: true);
         }
         catch (Exception ex)
         {
-            appSessions = [];
-            appGroups = [];
-            BindAppSessionsGrid();
-            UpdateChannelControlAvailability();
-            AppendLog($"Audio session refresh error: {ex.Message}");
+            HandleAppRefreshError(ex, bindGrid: true);
         }
+        finally
+        {
+            isRefreshingApps = false;
+        }
+    }
+
+    private async Task<bool> RefreshAppSessionsAsync(
+        bool logDetails,
+        bool autoTriggered = false,
+        bool force = false,
+        bool bindGrid = false)
+    {
+        if (isRefreshingApps)
+        {
+            if (autoTriggered)
+            {
+                LogRoutingMessage("refresh-apps-skipped-running", "Refresh apps skipped: already running.", autoTriggered: true);
+            }
+            else
+            {
+                AppendLog("Refresh apps skipped: already running.");
+            }
+
+            return false;
+        }
+
+        var now = DateTime.UtcNow;
+        if (autoTriggered && !force && now - lastRefreshAppsUtc < autoRefreshInterval)
+        {
+            return false;
+        }
+
+        isRefreshingApps = true;
+        try
+        {
+            if (logDetails)
+            {
+                AppendLog("Refresh apps started.");
+            }
+
+            var endpointSnapshot = endpoints.ToList();
+            var refreshedSessions = await Task.Run(() => audioSessionController.GetAudioSessions(endpointSnapshot));
+            if (IsDisposed || Disposing)
+            {
+                return false;
+            }
+
+            ApplyRefreshedAppSessions(
+                refreshedSessions,
+                logDetails,
+                bindGrid || mainTabControl.SelectedTab == routingTabPage);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (!IsDisposed && !Disposing)
+            {
+                HandleAppRefreshError(ex, bindGrid || mainTabControl.SelectedTab == routingTabPage);
+            }
+
+            return false;
+        }
+        finally
+        {
+            isRefreshingApps = false;
+        }
+    }
+
+    private void ApplyRefreshedAppSessions(
+        IReadOnlyList<AudioAppSession> refreshedSessions,
+        bool logDetails,
+        bool bindGrid)
+    {
+        var oldGroups = appGroups;
+        appSessions = refreshedSessions;
+        AssignChannelsToSessions();
+        var refreshedGroups = BuildAppGroups();
+        var changeCount = CountAppGroupChanges(oldGroups, refreshedGroups);
+        appGroups = refreshedGroups;
+
+        if (bindGrid)
+        {
+            BindAppSessionsGrid();
+        }
+
+        UpdateChannelControlAvailability();
+        lastRefreshAppsUtc = DateTime.UtcNow;
+
+        if (logDetails || changeCount > 0)
+        {
+            AppendLog($"Refresh apps completed: {appGroups.Count} groups, {changeCount} changes.");
+        }
+
+        if (logDetails)
+        {
+            AppendLog($"Found {appSessions.Count} active audio app session(s) across {appGroups.Count} app group(s).");
+            foreach (var group in appGroups)
+            {
+                AppendLog(
+                    $"App group: {group.ProcessName}, PIDs = {FormatProcessIds(group.ProcessIds)}, sessions = {group.SessionCount}, endpoints = {group.CurrentEndpointsSummary}, target = {group.TargetEndpointFriendlyName}, volume = {group.VolumePercent}%, channel = {group.AssignedChannel}, status = {group.Status}");
+            }
+        }
+    }
+
+    private void HandleAppRefreshError(Exception ex, bool bindGrid)
+    {
+        appSessions = [];
+        appGroups = [];
+        if (bindGrid)
+        {
+            BindAppSessionsGrid();
+        }
+
+        UpdateChannelControlAvailability();
+        AppendLog($"Audio session refresh error: {ex.Message}");
+    }
+
+    private static int CountAppGroupChanges(
+        IReadOnlyList<AudioAppGroup> oldGroups,
+        IReadOnlyList<AudioAppGroup> newGroups)
+    {
+        var oldSignatures = oldGroups.ToDictionary(
+            group => group.ProcessName,
+            GetAppGroupSignature,
+            StringComparer.OrdinalIgnoreCase);
+        var newSignatures = newGroups.ToDictionary(
+            group => group.ProcessName,
+            GetAppGroupSignature,
+            StringComparer.OrdinalIgnoreCase);
+
+        var changes = newSignatures.Count(group =>
+            !oldSignatures.TryGetValue(group.Key, out var oldSignature) ||
+            !oldSignature.Equals(group.Value, StringComparison.Ordinal));
+        changes += oldSignatures.Keys.Count(processName => !newSignatures.ContainsKey(processName));
+        return changes;
+    }
+
+    private static string GetAppGroupSignature(AudioAppGroup group)
+    {
+        return string.Join(
+            "|",
+            group.AssignedChannel,
+            group.TargetEndpointId ?? string.Empty,
+            group.Status,
+            group.SessionCount.ToString(CultureInfo.InvariantCulture),
+            FormatProcessIds(group.ProcessIds),
+            group.CurrentEndpointsSummary);
+    }
+
+    private async Task HandleAutoApplyTimerTickAsync()
+    {
+        if (!settings.AutoApplyRoutingRules)
+        {
+            return;
+        }
+
+        var refreshed = await RefreshAppSessionsAsync(
+            logDetails: false,
+            autoTriggered: true,
+            force: false,
+            bindGrid: false);
+        if (!refreshed)
+        {
+            return;
+        }
+
+        await AutoApplyPendingRoutesAsync();
     }
 
     private void ApplyRouting(bool autoTriggered)
     {
+        if (isApplyingRouting)
+        {
+            LogRoutingMessage(
+                autoTriggered ? "auto-apply-skipped-running" : "manual-apply-skipped-running",
+                autoTriggered ? "Auto apply skipped: routing already running." : "Apply Routing skipped: routing already running.",
+                autoTriggered);
+            return;
+        }
+
+        isApplyingRouting = true;
+        try
+        {
         if (autoTriggered)
         {
             RefreshAppSessions(logDetails: false);
@@ -2038,6 +2436,11 @@ public partial class MainForm : Form
         RefreshAppSessions(logDetails: !autoTriggered);
         ApplyPostRoutingStatuses(successfulRoutes);
         LogPostApplyRoutingState(autoTriggered, successfulRoutes);
+        }
+        finally
+        {
+            isApplyingRouting = false;
+        }
     }
 
     private bool ApplyRoutingToGroup(
@@ -2567,13 +2970,11 @@ public partial class MainForm : Form
             };
         }
 
-        settings.RoutingRules = rules
-            .OrderBy(rule => rule.Key, StringComparer.OrdinalIgnoreCase)
-            .Select(rule => rule.Value)
-            .ToList();
+        StoreRoutingRuleMap(rules);
 
         AssignChannelsToSessions();
         appGroups = BuildAppGroups();
+        UpdateMixerAppSummaries();
 
         if (persist)
         {
@@ -2586,33 +2987,386 @@ public partial class MainForm : Form
     {
         foreach (var controls in channelControlsByName.Values)
         {
-            var activeSessionCount = appSessions.Count(session =>
-                session.AssignedChannel.Equals(controls.Channel.Name, StringComparison.OrdinalIgnoreCase));
-            var endpointSelected = !string.IsNullOrWhiteSpace(controls.Channel.SelectedEndpointId) &&
-                endpoints.Any(endpoint => endpoint.Id.Equals(controls.Channel.SelectedEndpointId, StringComparison.OrdinalIgnoreCase));
+            SetEndpointControlsEnabled(controls, enabled: true);
+        }
 
-            if (activeSessionCount > 0)
+        UpdateMixerAppSummaries();
+    }
+
+    private void UpdateMixerAppSummaries()
+    {
+        UpdateMasterStripSummary();
+
+        foreach (var controls in channelControlsByName.Values)
+        {
+            var assignedGroups = appGroups
+                .Where(group => group.AssignedChannel.Equals(controls.Channel.Name, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var signature = BuildAppChipSignature(assignedGroups);
+            if (channelAppChipSignatures.TryGetValue(controls.Channel.Name, out var previousSignature) &&
+                previousSignature.Equals(signature, StringComparison.Ordinal))
             {
-                SetEndpointControlsEnabled(controls, enabled: true);
-                SetStatus(controls, controls.Channel.IsMuted ? "Muted" : "Apps");
+                continue;
             }
-            else if (endpointSelected)
+
+            channelAppChipSignatures[controls.Channel.Name] = signature;
+            var visibleGroups = assignedGroups.Take(4).ToList();
+            var chips = visibleGroups
+                .Select(group => CreateAppChip(group, controls.Channel.Name))
+                .Cast<Control>()
+                .ToList();
+            controls.StripControl.SetAppChips(chips, assignedGroups.Count - visibleGroups.Count);
+            RegisterChannelDropTargetForChildren(controls.StripControl.AppChipsPanel, controls.Channel.Name);
+        }
+
+        UpdateUnassignedAppChips();
+    }
+
+    private void UpdateUnassignedAppChips()
+    {
+        if (unassignedAppsFlowPanel is null)
+        {
+            return;
+        }
+
+        var unassignedGroups = appGroups
+            .Where(group => group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+            .Where(group => !ShouldHideFromUnassignedMixer(group))
+            .OrderBy(group => group.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var signature = BuildAppChipSignature(unassignedGroups);
+        if (unassignedAppChipSignature.Equals(signature, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        unassignedAppChipSignature = signature;
+        unassignedAppsFlowPanel.SuspendLayout();
+        var oldControls = unassignedAppsFlowPanel.Controls.Cast<Control>().ToList();
+        unassignedAppsFlowPanel.Controls.Clear();
+        foreach (var control in oldControls)
+        {
+            control.Dispose();
+        }
+
+        if (unassignedGroups.Count == 0)
+        {
+            var placeholder = CreateMixerPlaceholderLabel("No apps");
+            RegisterUnassignedDropTarget(placeholder);
+            unassignedAppsFlowPanel.Controls.Add(placeholder);
+        }
+        else
+        {
+            foreach (var group in unassignedGroups)
             {
-                SetEndpointControlsEnabled(controls, enabled: true);
-                SetStatus(controls, controls.Channel.IsMuted ? "Muted" : "Found");
+                unassignedAppsFlowPanel.Controls.Add(CreateAppChip(group, channelDropTarget: null));
             }
-            else
-            {
-                MarkEndpointUnavailable(controls, "Not found");
-            }
+        }
+
+        unassignedAppsFlowPanel.ResumeLayout();
+    }
+
+    private AppChipControl CreateAppChip(AudioAppGroup group, string? channelDropTarget)
+    {
+        var chip = new AppChipControl(group.ProcessName, GetAppChipStatus(group));
+        if (channelDropTarget is null)
+        {
+            RegisterUnassignedDropTarget(chip);
+            RegisterUnassignedDropTargetForChildren(chip);
+        }
+
+        return chip;
+    }
+
+    private static string BuildAppChipSignature(IEnumerable<AudioAppGroup> groups)
+    {
+        return string.Join(
+            "||",
+            groups.Select(group => string.Join(
+                "|",
+                group.ProcessName,
+                group.AssignedChannel,
+                group.TargetEndpointId ?? string.Empty,
+                group.CurrentEndpointsSummary,
+                GetAppChipStatus(group).ToString())));
+    }
+
+    private void RegisterUnassignedDropTargetForChildren(Control control)
+    {
+        foreach (Control child in control.Controls)
+        {
+            RegisterUnassignedDropTarget(child);
+            RegisterUnassignedDropTargetForChildren(child);
         }
     }
 
-    private IEnumerable<string> GetProcessNamesForChannel(string channelName)
+    private static Label CreateMixerPlaceholderLabel(string text)
     {
-        return settings.RoutingRules
-            .Where(rule => rule.Enabled && rule.PreferredChannel.Equals(channelName, StringComparison.OrdinalIgnoreCase))
-            .Select(rule => rule.ProcessName);
+        return new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(6, 7, 4, 4),
+            Font = new Font("Segoe UI", 8.5F),
+            ForeColor = Color.FromArgb(170, 176, 188),
+            Text = text
+        };
+    }
+
+    private static bool ShouldHideFromUnassignedMixer(AudioAppGroup group)
+    {
+        return group.ProcessName.Equals("System Sounds", StringComparison.OrdinalIgnoreCase) ||
+            group.DisplayName.Equals("System Sounds", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static AppChipStatus GetAppChipStatus(AudioAppGroup group)
+    {
+        if (group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            return AppChipStatus.Neutral;
+        }
+
+        if (group.Status.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(group.TargetEndpointId))
+        {
+            return AppChipStatus.Error;
+        }
+
+        return group.AreAllSessionsOnTarget() ||
+            group.Status.Contains("Routed", StringComparison.OrdinalIgnoreCase) ||
+            group.Status.Contains("Already", StringComparison.OrdinalIgnoreCase)
+                ? AppChipStatus.Routed
+                : AppChipStatus.Pending;
+    }
+
+    private void AssignAppFromMixer(string processName, string? channelName)
+    {
+        var normalizedProcessName = NormalizeProcessName(processName);
+        if (string.IsNullOrWhiteSpace(normalizedProcessName))
+        {
+            return;
+        }
+
+        var rules = GetRoutingRuleMap();
+        if (string.IsNullOrWhiteSpace(channelName) ||
+            channelName.Equals("None", StringComparison.OrdinalIgnoreCase))
+        {
+            rules.Remove(normalizedProcessName);
+            AppendLog($"Unassigned {normalizedProcessName}");
+        }
+        else
+        {
+            var channel = MixerChannel.DefaultChannelNames.FirstOrDefault(name =>
+                name.Equals(channelName, StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrWhiteSpace(channel))
+            {
+                AppendLog($"Cannot assign {normalizedProcessName}: unknown channel {channelName}.");
+                return;
+            }
+
+            var target = ResolveTargetEndpoint(channel, null);
+            rules[normalizedProcessName] = new AppRoutingRule
+            {
+                ProcessName = normalizedProcessName,
+                PreferredChannel = channel,
+                PreferredEndpointId = target?.Id,
+                PreferredEndpointFriendlyName = target?.FriendlyName,
+                Enabled = true
+            };
+            AppendLog($"Assigned {normalizedProcessName} to {channel}");
+        }
+
+        StoreRoutingRuleMap(rules);
+        AssignChannelsToSessions();
+        appGroups = BuildAppGroups();
+        BindAppSessionsGrid();
+        UpdateChannelControlAvailability();
+        SaveSettings();
+
+        if (!string.IsNullOrWhiteSpace(channelName) &&
+            !channelName.Equals("None", StringComparison.OrdinalIgnoreCase) &&
+            settings.AutoApplyRoutingRules)
+        {
+            _ = AutoApplyPendingRoutesAsync(normalizedProcessName);
+        }
+    }
+
+    private async Task AutoApplyPendingRoutesAsync(string? onlyProcessName = null)
+    {
+        if (isApplyingRouting)
+        {
+            LogRoutingMessage("auto-apply-skipped-running", "Auto apply skipped: routing already running.", autoTriggered: true);
+            return;
+        }
+
+        var requests = BuildAutoRoutingRequests(onlyProcessName);
+        if (requests.Count == 0)
+        {
+            return;
+        }
+
+        isApplyingRouting = true;
+        try
+        {
+            var outcomes = await Task.Run(() =>
+                requests
+                    .Select(request => new AutoRoutingOutcome(
+                        request,
+                        request.ProcessIds
+                            .Select(processId => audioPolicyRouter.TrySetAppOutputDevice(
+                                (uint)processId,
+                                request.ProcessName,
+                                request.TargetEndpointId,
+                                request.TargetEndpointFriendlyName))
+                            .ToList()))
+                    .ToList());
+
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
+
+            foreach (var outcome in outcomes)
+            {
+                var routeKey = GetRouteKey(outcome.Request.ProcessName, outcome.Request.TargetEndpointId);
+                var success = outcome.Results.Any(result => result.Success);
+                var status = success
+                    ? "Routed preference saved"
+                    : outcome.Results.LastOrDefault()?.Status ?? "Error";
+                lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(
+                    DateTime.UtcNow,
+                    status,
+                    string.Join(",", outcome.Request.ProcessIds));
+
+                foreach (var result in outcome.Results)
+                {
+                    LogRoutingResult(result, autoTriggered: true);
+                }
+
+                var group = appGroups.FirstOrDefault(group =>
+                    group.ProcessName.Equals(outcome.Request.ProcessName, StringComparison.OrdinalIgnoreCase));
+                if (group is not null)
+                {
+                    group.Status = status;
+                }
+
+                AppendLog(success
+                    ? $"Auto apply routed {outcome.Request.ProcessName} -> {outcome.Request.AssignedChannel}"
+                    : $"Auto apply {outcome.Request.ProcessName} -> {outcome.Request.AssignedChannel}: {status}");
+            }
+
+            if (mainTabControl.SelectedTab == routingTabPage)
+            {
+                BindAppSessionsGrid();
+            }
+
+            UpdateMixerAppSummaries();
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Auto apply error: {ex.Message}");
+        }
+        finally
+        {
+            isApplyingRouting = false;
+        }
+    }
+
+    private List<AutoRoutingRequest> BuildAutoRoutingRequests(string? onlyProcessName)
+    {
+        var now = DateTime.UtcNow;
+        var requests = new List<AutoRoutingRequest>();
+        foreach (var group in appGroups)
+        {
+            if (!string.IsNullOrWhiteSpace(onlyProcessName) &&
+                !NormalizeProcessName(group.ProcessName).Equals(
+                    NormalizeProcessName(onlyProcessName),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (group.AssignedChannel.Equals("None", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(group.TargetEndpointId) ||
+                group.ProcessIds.Count == 0)
+            {
+                continue;
+            }
+
+            var routeKey = GetRouteKey(group.ProcessName, group.TargetEndpointId);
+            if (group.AreAllSessionsOnTarget())
+            {
+                LogRoutingMessage(
+                    $"auto-apply-already-routed:{routeKey}",
+                    $"Auto apply skipped: already routed {group.ProcessName}.",
+                    autoTriggered: true);
+                continue;
+            }
+
+            if (!settings.EnableExperimentalAutomaticRouting)
+            {
+                LogManualRoutingRequired(group.ProcessName, group.TargetEndpointFriendlyName, autoTriggered: true);
+                continue;
+            }
+
+            var routablePids = group.ProcessIds.Where(pid => pid > 0).OrderBy(pid => pid).ToList();
+            if (routablePids.Count == 0)
+            {
+                LogRoutingMessage(
+                    $"auto-apply-unroutable:{routeKey}",
+                    $"Auto apply skipped: {group.ProcessName} has no routable process.",
+                    autoTriggered: true);
+                continue;
+            }
+
+            var pidSignature = string.Join(",", routablePids);
+            if (lastAutoRoutingAttempts.TryGetValue(routeKey, out var lastAttempt))
+            {
+                // Re-routing an app whose preference is already saved only helps once
+                // its process set changes (restart); repeating the policy write every
+                // cycle makes audiosrv re-evaluate live streams and glitches audio.
+                if (lastAttempt.Status.Equals("Routed preference saved", StringComparison.OrdinalIgnoreCase) &&
+                    lastAttempt.PidSignature == pidSignature)
+                {
+                    LogRoutingMessage(
+                        $"auto-apply-saved:{routeKey}",
+                        $"Auto apply skipped: routing preference already saved for {group.ProcessName}.",
+                        autoTriggered: true);
+                    continue;
+                }
+
+                if (now - lastAttempt.Utc < autoRoutingCooldown)
+                {
+                    LogRoutingMessage(
+                        $"auto-apply-recent:{routeKey}",
+                        $"Auto apply skipped: recently applied {group.ProcessName}.",
+                        autoTriggered: true);
+                    continue;
+                }
+            }
+
+            lastAutoRoutingAttempts[routeKey] = new AutoRoutingAttempt(now, "Started", pidSignature);
+            requests.Add(new AutoRoutingRequest(
+                group.ProcessName,
+                group.AssignedChannel,
+                group.TargetEndpointId,
+                group.TargetEndpointFriendlyName,
+                routablePids));
+        }
+
+        return requests;
+    }
+
+    private void StoreRoutingRuleMap(IDictionary<string, AppRoutingRule> rules)
+    {
+        settings.RoutingRules = rules
+            .OrderBy(rule => rule.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(rule =>
+            {
+                rule.Value.ProcessName = rule.Key;
+                return rule.Value;
+            })
+            .ToList();
     }
 
     private Dictionary<string, AppRoutingRule> GetRoutingRuleMap()
@@ -3014,33 +3768,27 @@ public partial class MainForm : Form
 
     private sealed class ChannelControls(
         MixerChannel channel,
-        ChannelStripControl stripControl)
+        DualMixChannelStripControl stripControl)
     {
         public MixerChannel Channel { get; } = channel;
 
-        public ChannelStripControl StripControl { get; } = stripControl;
-
-        public ComboBox EndpointComboBox => StripControl.EndpointComboBox;
-
-        public TrackBar VolumeTrackBar => StripControl.VolumeTrackBar;
-
-        public Button MuteButton => StripControl.MuteButton;
-
-        public Label StatusLabel => StripControl.StatusLabel;
+        public DualMixChannelStripControl StripControl { get; } = stripControl;
 
         public bool IsUpdating { get; set; }
     }
 
-    private sealed class StreamChannelControls(
-        string channelName,
-        ChannelStripControl stripControl)
-    {
-        public string ChannelName { get; } = channelName;
+    private sealed record AutoRoutingAttempt(DateTime Utc, string Status, string PidSignature = "");
 
-        public ChannelStripControl StripControl { get; } = stripControl;
+    private sealed record AutoRoutingRequest(
+        string ProcessName,
+        string AssignedChannel,
+        string TargetEndpointId,
+        string TargetEndpointFriendlyName,
+        IReadOnlyList<int> ProcessIds);
 
-        public bool IsUpdating { get; set; }
-    }
+    private sealed record AutoRoutingOutcome(
+        AutoRoutingRequest Request,
+        IReadOnlyList<AppOutputRoutingResult> Results);
 
     private sealed class EndpointChoice
     {

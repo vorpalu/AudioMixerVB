@@ -8,6 +8,7 @@ public sealed class StreamMixEngine : IDisposable
 {
     private const int MixSampleRate = 48000;
     private const int MixChannels = 2;
+    private const int CaptureBufferMs = 20;
     private readonly object syncRoot = new();
     private readonly Dictionary<string, string> channelInputEndpointIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, float> channelGains = new(StringComparer.OrdinalIgnoreCase);
@@ -21,7 +22,7 @@ public sealed class StreamMixEngine : IDisposable
     private MasterSampleProvider? masterProvider;
     private string? outputEndpointId;
     private bool disposed;
-    private bool isStopping;
+    private volatile bool isStopping;
     private float masterGain = 1f;
     private bool masterMuted;
 
@@ -41,18 +42,12 @@ public sealed class StreamMixEngine : IDisposable
 
     public bool IsRunning { get; private set; }
 
-    public bool IsStopping
-    {
-        get
-        {
-            lock (syncRoot)
-            {
-                return isStopping;
-            }
-        }
-    }
+    // Volatile read instead of locking syncRoot: this is checked on every capture
+    // packet, and sharing a lock with the UI meter timer stalls the audio threads
+    // whenever the UI thread is preempted while holding it.
+    public bool IsStopping => isStopping;
 
-    public int LatencyMs { get; set; } = 60;
+    public int LatencyMs { get; set; } = 20;
 
     public float GetChannelPeak(string channelName)
     {
@@ -237,16 +232,23 @@ public sealed class StreamMixEngine : IDisposable
             }
 
             var captureDevice = FindDevice(endpointId, NAudio.CoreAudioApi.DataFlow.Capture);
-            var capture = new WasapiCapture(captureDevice);
+            var capture = new WasapiCapture(captureDevice, true, CaptureBufferMs);
             var bufferedProvider = new BufferedWaveProvider(capture.WaveFormat)
             {
-                BufferDuration = TimeSpan.FromMilliseconds(Math.Max(500, LatencyMs * 12)),
+                BufferDuration = TimeSpan.FromMilliseconds(Math.Max(500, LatencyMs * 4)),
                 DiscardOnBufferOverflow = true,
                 ReadFully = true
             };
 
+            var captureBytesPerMs = Math.Max(1, capture.WaveFormat.AverageBytesPerSecond / 1000);
+            var queueState = new CaptureQueueState(Math.Max(15, LatencyMs));
+            var trimBuffer = new byte[capture.WaveFormat.AverageBytesPerSecond / 4];
+            var lastTrimLogTicks = 0L;
+            var lastDryLogTicks = 0L;
+            var lastAudibleTicks = 0L;
             EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
             {
+                ProAudioThread.Register();
                 if (IsStopping)
                 {
                     return;
@@ -254,7 +256,75 @@ public sealed class StreamMixEngine : IDisposable
 
                 try
                 {
+                    var format = bufferedProvider.WaveFormat;
+                    queueState.OnPacket(args.BytesRecorded / (double)captureBytesPerMs);
+                    if (CaptureQueueState.HasAudibleContent(args.Buffer, args.BytesRecorded))
+                    {
+                        lastAudibleTicks = Environment.TickCount64;
+                    }
+
+                    // A dry queue means the source just (re)started: idle cables stop
+                    // delivering, so the cushion is gone. Pre-fill with silence so playback
+                    // does not starve on every packet boundary for the seconds the servo
+                    // would need to rebuild the cushion at its capped rate.
+                    if (bufferedProvider.BufferedBytes == 0)
+                    {
+                        queueState.OnDry();
+                        var prefillBytes = Math.Min(
+                            (int)(queueState.EffectiveTargetMs * captureBytesPerMs),
+                            trimBuffer.Length);
+                        prefillBytes -= prefillBytes % format.BlockAlign;
+                        if (prefillBytes > 0)
+                        {
+                            Array.Clear(trimBuffer, 0, prefillBytes);
+                            bufferedProvider.AddSamples(trimBuffer, 0, prefillBytes);
+
+                            var dryNow = Environment.TickCount64;
+                            if (dryNow - lastDryLogTicks >= 5000)
+                            {
+                                lastDryLogTicks = dryNow;
+                                var audibility = lastAudibleTicks == 0
+                                    ? "no audio seen yet"
+                                    : dryNow - lastAudibleTicks <= 200
+                                        ? "AUDIBLE interruption"
+                                        : $"source silent for {dryNow - lastAudibleTicks} ms";
+                                OnLog?.Invoke(this, $"Stream {channelName} queue ran dry; inserted {prefillBytes / captureBytesPerMs} ms cushion ({audibility}).");
+                            }
+                        }
+                    }
+
                     bufferedProvider.AddSamples(args.Buffer, 0, args.BytesRecorded);
+
+                    // Ordinary clock drift is corrected inaudibly by the servo resampler;
+                    // this skip-ahead only recovers from real stalls that leave a large
+                    // burst queued. The backlog must be re-read on every pass: the playback
+                    // thread drains this buffer concurrently, and with ReadFully enabled
+                    // Read never reports starvation, so a stale excess would over-trim.
+                    var targetBytes = (int)(queueState.EffectiveTargetMs * captureBytesPerMs);
+                    var thresholdBytes = targetBytes + captureBytesPerMs * 60;
+                    if (bufferedProvider.BufferedBytes > thresholdBytes)
+                    {
+                        var droppedBytes = 0;
+                        while (true)
+                        {
+                            var excessBytes = bufferedProvider.BufferedBytes - targetBytes;
+                            var chunk = Math.Min(excessBytes, trimBuffer.Length);
+                            chunk -= chunk % format.BlockAlign;
+                            if (chunk <= 0)
+                            {
+                                break;
+                            }
+
+                            droppedBytes += bufferedProvider.Read(trimBuffer, 0, chunk);
+                        }
+
+                        var now = Environment.TickCount64;
+                        if (droppedBytes > 0 && now - lastTrimLogTicks >= 5000)
+                        {
+                            lastTrimLogTicks = now;
+                            OnLog?.Invoke(this, $"Stream {channelName} stall recovery: dropped {droppedBytes / captureBytesPerMs} ms of queued audio.");
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -280,18 +350,28 @@ public sealed class StreamMixEngine : IDisposable
 
             ISampleProvider sampleProvider = bufferedProvider.ToSampleProvider();
             sampleProvider = EnsureStereo(sampleProvider);
-            if (sampleProvider.WaveFormat.SampleRate != MixSampleRate)
-            {
-                sampleProvider = new WdlResamplingSampleProvider(sampleProvider, MixSampleRate);
-            }
 
+            // The servo resampler keeps the queue at the target depth by nudging the
+            // playback rate, so per-cable clock drift never accumulates into trims.
+            sampleProvider = new DriftCompensatingSampleProvider(
+                sampleProvider,
+                MixSampleRate,
+                () => (double)bufferedProvider.BufferedBytes / captureBytesPerMs,
+                () => queueState.EffectiveTargetMs,
+                queueState.OnRead,
+                $"Stream {channelName}",
+                message => OnLog?.Invoke(this, message));
+
+            // Resolve the meter once so the playback thread updates it directly and
+            // never touches syncRoot, which the UI meter timer locks ~25x per second.
+            var channelMeter = GetOrCreateMeter(channelName);
             var gainProvider = new StreamChannelSampleProvider(
                 channelName,
                 sampleProvider,
                 channelGains.GetValueOrDefault(channelName, 1.0f),
                 channelMutes.GetValueOrDefault(channelName),
                 message => OnLog?.Invoke(this, message),
-                (peak, rms) => UpdateChannelMeter(channelName, peak, rms));
+                channelMeter.Update);
 
             activeProviders[channelName] = gainProvider;
             mixer.AddMixerInput(gainProvider);
@@ -301,7 +381,9 @@ public sealed class StreamMixEngine : IDisposable
                 bufferedProvider,
                 dataAvailableHandler,
                 recordingStoppedHandler));
-            OnLog?.Invoke(this, $"Started stream capture for {channelName}: {captureDevice.FriendlyName}");
+            OnLog?.Invoke(
+                this,
+                $"Started stream capture for {channelName}: {captureDevice.FriendlyName} ({capture.WaveFormat.SampleRate} Hz, {capture.WaveFormat.Channels} ch)");
         }
 
         if (captureChannels.Count == 0)
@@ -309,8 +391,14 @@ public sealed class StreamMixEngine : IDisposable
             throw new InvalidOperationException("Select at least one stream input before starting.");
         }
 
-        masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, UpdateMasterMeter);
-        output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, false, LatencyMs);
+        masterProvider = new MasterSampleProvider(
+            mixer,
+            masterGain,
+            masterMuted,
+            masterMeter.Update,
+            LatencyMs,
+            message => OnLog?.Invoke(this, message));
+        output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, true, LatencyMs);
         output.Init(masterProvider.ToWaveProvider());
 
         foreach (var channel in captureChannels)
@@ -439,26 +527,15 @@ public sealed class StreamMixEngine : IDisposable
         }
     }
 
-    private void UpdateChannelMeter(string channelName, float peak, float rms)
+    private MeterState GetOrCreateMeter(string channelName)
     {
-        lock (syncRoot)
+        if (!channelMeters.TryGetValue(channelName, out var meter))
         {
-            if (!channelMeters.TryGetValue(channelName, out var meter))
-            {
-                meter = new MeterState();
-                channelMeters[channelName] = meter;
-            }
-
-            meter.Update(peak, rms);
+            meter = new MeterState();
+            channelMeters[channelName] = meter;
         }
-    }
 
-    private void UpdateMasterMeter(float peak, float rms)
-    {
-        lock (syncRoot)
-        {
-            masterMeter.Update(peak, rms);
-        }
+        return meter;
     }
 
     private void ResetMeters()
@@ -661,7 +738,11 @@ public sealed class StreamMixEngine : IDisposable
     {
         private readonly ISampleProvider source;
         private readonly Action<float, float> updateMeter;
+        private readonly Action<string> log;
+        private readonly int stallThresholdMs;
         private readonly object masterLock = new();
+        private long lastReadTicks;
+        private long lastStallLogTicks;
         private float gain;
         private bool muted;
 
@@ -669,12 +750,16 @@ public sealed class StreamMixEngine : IDisposable
             ISampleProvider source,
             float gain,
             bool muted,
-            Action<float, float> updateMeter)
+            Action<float, float> updateMeter,
+            int expectedReadIntervalMs,
+            Action<string> log)
         {
             this.source = source;
             this.gain = Math.Clamp(gain, 0f, 1f);
             this.muted = muted;
             this.updateMeter = updateMeter;
+            this.log = log;
+            stallThresholdMs = expectedReadIntervalMs * 2 + 10;
             WaveFormat = source.WaveFormat;
         }
 
@@ -691,6 +776,22 @@ public sealed class StreamMixEngine : IDisposable
 
         public int Read(float[] buffer, int offset, int count)
         {
+            ProAudioThread.Register();
+
+            // Long gaps between reads mean the playback thread itself stalled
+            // (GC, driver, scheduler) - the one failure mode queue logs can't see.
+            var now = Environment.TickCount64;
+            if (lastReadTicks != 0)
+            {
+                var gapMs = now - lastReadTicks;
+                if (gapMs > stallThresholdMs && now - lastStallLogTicks >= 5000)
+                {
+                    lastStallLogTicks = now;
+                    log($"Stream output read gap of {gapMs} ms; the playback thread stalled.");
+                }
+            }
+
+            lastReadTicks = now;
             var read = source.Read(buffer, offset, count);
 
             float currentGain;
