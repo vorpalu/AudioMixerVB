@@ -13,6 +13,7 @@ namespace AudioMixerVB;
 public sealed class DriftCompensatingSampleProvider : ISampleProvider
 {
     private const double MaxRateCorrection = 0.01;
+    private const double MaxPanicCorrection = 0.03;
     private const double CorrectionPerMsError = 0.0002;
     private const double BacklogSmoothing = 0.05;
     private const int StatsLogIntervalMs = 30000;
@@ -73,10 +74,23 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
             ? measured
             : smoothedBacklogMs + BacklogSmoothing * (measured - smoothedBacklogMs);
 
+        var target = targetBacklogMs();
         var correction = Math.Clamp(
-            (smoothedBacklogMs - targetBacklogMs()) * CorrectionPerMsError,
+            (smoothedBacklogMs - target) * CorrectionPerMsError,
             -MaxRateCorrection,
             MaxRateCorrection);
+
+        // The smoothed servo tracks slow drift; a source pump that suddenly
+        // under-delivers drains the queue faster than the EMA reacts. Brake on
+        // the instantaneous level before the queue dies - a momentary slowdown
+        // is far less audible than a dropout.
+        var panicFloor = target * 0.5;
+        if (panicFloor > 0 && measured < panicFloor)
+        {
+            var brake = -MaxPanicCorrection * (1.0 - measured / panicFloor);
+            correction = Math.Min(correction, brake);
+        }
+
         resampler.SetRates(source.WaveFormat.SampleRate * (1.0 + correction), WaveFormat.SampleRate);
 
         // A correction pinned at the cap means the source clock is outside the
@@ -85,7 +99,7 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
         if (log is not null && now - lastStatsLogTicks >= StatsLogIntervalMs)
         {
             lastStatsLogTicks = now;
-            log($"{name} servo: backlog {smoothedBacklogMs:F0} ms, target {targetBacklogMs():F0} ms, rate correction {correction * 100:+0.00;-0.00;+0.00}%");
+            log($"{name} servo: backlog {smoothedBacklogMs:F0} ms, target {target:F0} ms, rate correction {correction * 100:+0.00;-0.00;+0.00}%");
         }
 
         var framesNeeded = resampler.ResamplePrepare(framesRequested, channels, out var inBuffer, out var inBufferOffset);

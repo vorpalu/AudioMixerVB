@@ -44,6 +44,23 @@ public sealed class CaptureQueueState
         }
     }
 
+    /// <summary>
+    /// True when the packet contains anything but digital silence. Used to
+    /// tell an audible interruption from a harmless silence-on-silence dry.
+    /// </summary>
+    public static bool HasAudibleContent(byte[] buffer, int byteCount)
+    {
+        for (var index = 0; index < byteCount; index++)
+        {
+            if (buffer[index] != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public void OnPacket(double packetMs)
     {
         var now = Environment.TickCount64;

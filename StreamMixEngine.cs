@@ -245,6 +245,7 @@ public sealed class StreamMixEngine : IDisposable
             var trimBuffer = new byte[capture.WaveFormat.AverageBytesPerSecond / 4];
             var lastTrimLogTicks = 0L;
             var lastDryLogTicks = 0L;
+            var lastAudibleTicks = 0L;
             EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
             {
                 ProAudioThread.Register();
@@ -257,6 +258,10 @@ public sealed class StreamMixEngine : IDisposable
                 {
                     var format = bufferedProvider.WaveFormat;
                     queueState.OnPacket(args.BytesRecorded / (double)captureBytesPerMs);
+                    if (CaptureQueueState.HasAudibleContent(args.Buffer, args.BytesRecorded))
+                    {
+                        lastAudibleTicks = Environment.TickCount64;
+                    }
 
                     // A dry queue means the source just (re)started: idle cables stop
                     // delivering, so the cushion is gone. Pre-fill with silence so playback
@@ -277,7 +282,12 @@ public sealed class StreamMixEngine : IDisposable
                             if (dryNow - lastDryLogTicks >= 5000)
                             {
                                 lastDryLogTicks = dryNow;
-                                OnLog?.Invoke(this, $"Stream {channelName} queue ran dry; inserted {prefillBytes / captureBytesPerMs} ms cushion.");
+                                var audibility = lastAudibleTicks == 0
+                                    ? "no audio seen yet"
+                                    : dryNow - lastAudibleTicks <= 200
+                                        ? "AUDIBLE interruption"
+                                        : $"source silent for {dryNow - lastAudibleTicks} ms";
+                                OnLog?.Invoke(this, $"Stream {channelName} queue ran dry; inserted {prefillBytes / captureBytesPerMs} ms cushion ({audibility}).");
                             }
                         }
                     }
