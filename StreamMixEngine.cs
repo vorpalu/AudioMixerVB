@@ -22,7 +22,7 @@ public sealed class StreamMixEngine : IDisposable
     private MasterSampleProvider? masterProvider;
     private string? outputEndpointId;
     private bool disposed;
-    private bool isStopping;
+    private volatile bool isStopping;
     private float masterGain = 1f;
     private bool masterMuted;
 
@@ -42,16 +42,10 @@ public sealed class StreamMixEngine : IDisposable
 
     public bool IsRunning { get; private set; }
 
-    public bool IsStopping
-    {
-        get
-        {
-            lock (syncRoot)
-            {
-                return isStopping;
-            }
-        }
-    }
+    // Volatile read instead of locking syncRoot: this is checked on every capture
+    // packet, and sharing a lock with the UI meter timer stalls the audio threads
+    // whenever the UI thread is preempted while holding it.
+    public bool IsStopping => isStopping;
 
     public int LatencyMs { get; set; } = 20;
 
@@ -323,13 +317,16 @@ public sealed class StreamMixEngine : IDisposable
                 sampleProvider = new WdlResamplingSampleProvider(sampleProvider, MixSampleRate);
             }
 
+            // Resolve the meter once so the playback thread updates it directly and
+            // never touches syncRoot, which the UI meter timer locks ~25x per second.
+            var channelMeter = GetOrCreateMeter(channelName);
             var gainProvider = new StreamChannelSampleProvider(
                 channelName,
                 sampleProvider,
                 channelGains.GetValueOrDefault(channelName, 1.0f),
                 channelMutes.GetValueOrDefault(channelName),
                 message => OnLog?.Invoke(this, message),
-                (peak, rms) => UpdateChannelMeter(channelName, peak, rms));
+                channelMeter.Update);
 
             activeProviders[channelName] = gainProvider;
             mixer.AddMixerInput(gainProvider);
@@ -347,7 +344,7 @@ public sealed class StreamMixEngine : IDisposable
             throw new InvalidOperationException("Select at least one stream input before starting.");
         }
 
-        masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, UpdateMasterMeter);
+        masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, masterMeter.Update);
         output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, true, LatencyMs);
         output.Init(masterProvider.ToWaveProvider());
 
@@ -477,26 +474,15 @@ public sealed class StreamMixEngine : IDisposable
         }
     }
 
-    private void UpdateChannelMeter(string channelName, float peak, float rms)
+    private MeterState GetOrCreateMeter(string channelName)
     {
-        lock (syncRoot)
+        if (!channelMeters.TryGetValue(channelName, out var meter))
         {
-            if (!channelMeters.TryGetValue(channelName, out var meter))
-            {
-                meter = new MeterState();
-                channelMeters[channelName] = meter;
-            }
-
-            meter.Update(peak, rms);
+            meter = new MeterState();
+            channelMeters[channelName] = meter;
         }
-    }
 
-    private void UpdateMasterMeter(float peak, float rms)
-    {
-        lock (syncRoot)
-        {
-            masterMeter.Update(peak, rms);
-        }
+        return meter;
     }
 
     private void ResetMeters()
