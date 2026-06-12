@@ -244,6 +244,7 @@ public sealed class StreamMixEngine : IDisposable
             var queueState = new CaptureQueueState(Math.Max(15, LatencyMs));
             var trimBuffer = new byte[capture.WaveFormat.AverageBytesPerSecond / 4];
             var lastTrimLogTicks = 0L;
+            var lastDryLogTicks = 0L;
             EventHandler<WaveInEventArgs> dataAvailableHandler = (_, args) =>
             {
                 ProAudioThread.Register();
@@ -271,6 +272,13 @@ public sealed class StreamMixEngine : IDisposable
                         {
                             Array.Clear(trimBuffer, 0, prefillBytes);
                             bufferedProvider.AddSamples(trimBuffer, 0, prefillBytes);
+
+                            var dryNow = Environment.TickCount64;
+                            if (dryNow - lastDryLogTicks >= 5000)
+                            {
+                                lastDryLogTicks = dryNow;
+                                OnLog?.Invoke(this, $"Stream {channelName} queue ran dry; inserted {prefillBytes / captureBytesPerMs} ms cushion.");
+                            }
                         }
                     }
 
@@ -338,7 +346,9 @@ public sealed class StreamMixEngine : IDisposable
                 sampleProvider,
                 MixSampleRate,
                 () => (double)bufferedProvider.BufferedBytes / captureBytesPerMs,
-                () => queueState.EffectiveTargetMs);
+                () => queueState.EffectiveTargetMs,
+                $"Stream {channelName}",
+                message => OnLog?.Invoke(this, message));
 
             // Resolve the meter once so the playback thread updates it directly and
             // never touches syncRoot, which the UI meter timer locks ~25x per second.
@@ -367,7 +377,13 @@ public sealed class StreamMixEngine : IDisposable
             throw new InvalidOperationException("Select at least one stream input before starting.");
         }
 
-        masterProvider = new MasterSampleProvider(mixer, masterGain, masterMuted, masterMeter.Update);
+        masterProvider = new MasterSampleProvider(
+            mixer,
+            masterGain,
+            masterMuted,
+            masterMeter.Update,
+            LatencyMs,
+            message => OnLog?.Invoke(this, message));
         output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, true, LatencyMs);
         output.Init(masterProvider.ToWaveProvider());
 
@@ -708,7 +724,11 @@ public sealed class StreamMixEngine : IDisposable
     {
         private readonly ISampleProvider source;
         private readonly Action<float, float> updateMeter;
+        private readonly Action<string> log;
+        private readonly int stallThresholdMs;
         private readonly object masterLock = new();
+        private long lastReadTicks;
+        private long lastStallLogTicks;
         private float gain;
         private bool muted;
 
@@ -716,12 +736,16 @@ public sealed class StreamMixEngine : IDisposable
             ISampleProvider source,
             float gain,
             bool muted,
-            Action<float, float> updateMeter)
+            Action<float, float> updateMeter,
+            int expectedReadIntervalMs,
+            Action<string> log)
         {
             this.source = source;
             this.gain = Math.Clamp(gain, 0f, 1f);
             this.muted = muted;
             this.updateMeter = updateMeter;
+            this.log = log;
+            stallThresholdMs = expectedReadIntervalMs * 2 + 10;
             WaveFormat = source.WaveFormat;
         }
 
@@ -739,6 +763,21 @@ public sealed class StreamMixEngine : IDisposable
         public int Read(float[] buffer, int offset, int count)
         {
             ProAudioThread.Register();
+
+            // Long gaps between reads mean the playback thread itself stalled
+            // (GC, driver, scheduler) - the one failure mode queue logs can't see.
+            var now = Environment.TickCount64;
+            if (lastReadTicks != 0)
+            {
+                var gapMs = now - lastReadTicks;
+                if (gapMs > stallThresholdMs && now - lastStallLogTicks >= 5000)
+                {
+                    lastStallLogTicks = now;
+                    log($"Stream output read gap of {gapMs} ms; the playback thread stalled.");
+                }
+            }
+
+            lastReadTicks = now;
             var read = source.Read(buffer, offset, count);
 
             float currentGain;

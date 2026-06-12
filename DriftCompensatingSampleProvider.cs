@@ -12,26 +12,34 @@ namespace AudioMixerVB;
 /// </summary>
 public sealed class DriftCompensatingSampleProvider : ISampleProvider
 {
-    private const double MaxRateCorrection = 0.004;
+    private const double MaxRateCorrection = 0.01;
     private const double CorrectionPerMsError = 0.0002;
     private const double BacklogSmoothing = 0.05;
+    private const int StatsLogIntervalMs = 30000;
 
     private readonly ISampleProvider source;
     private readonly WdlResampler resampler;
     private readonly Func<double> backlogMs;
     private readonly Func<double> targetBacklogMs;
+    private readonly string name;
+    private readonly Action<string>? log;
     private readonly int channels;
     private double smoothedBacklogMs = double.NaN;
+    private long lastStatsLogTicks = Environment.TickCount64;
 
     public DriftCompensatingSampleProvider(
         ISampleProvider source,
         int outputSampleRate,
         Func<double> backlogMs,
-        Func<double> targetBacklogMs)
+        Func<double> targetBacklogMs,
+        string name,
+        Action<string>? log)
     {
         this.source = source;
         this.backlogMs = backlogMs;
         this.targetBacklogMs = targetBacklogMs;
+        this.name = name;
+        this.log = log;
         channels = source.WaveFormat.Channels;
         WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(outputSampleRate, channels);
 
@@ -65,6 +73,15 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
             -MaxRateCorrection,
             MaxRateCorrection);
         resampler.SetRates(source.WaveFormat.SampleRate * (1.0 + correction), WaveFormat.SampleRate);
+
+        // A correction pinned at the cap means the source clock is outside the
+        // servo's reach and the queue will dry out or grow - surface that.
+        var now = Environment.TickCount64;
+        if (log is not null && now - lastStatsLogTicks >= StatsLogIntervalMs)
+        {
+            lastStatsLogTicks = now;
+            log($"{name} servo: backlog {smoothedBacklogMs:F0} ms, target {targetBacklogMs():F0} ms, rate correction {correction * 100:+0.00;-0.00}%");
+        }
 
         var framesNeeded = resampler.ResamplePrepare(framesRequested, channels, out var inBuffer, out var inBufferOffset);
         var framesRead = source.Read(inBuffer, inBufferOffset, framesNeeded * channels) / channels;
