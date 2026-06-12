@@ -18,6 +18,7 @@ public sealed class CaptureQueueState
     private readonly double baseTargetMs;
     private double peakPacketMs;
     private double peakGapMs;
+    private double peakReadMs;
     private long lastPacketTicks;
     private long lastDecayTicks = Environment.TickCount64;
 
@@ -26,9 +27,22 @@ public sealed class CaptureQueueState
         this.baseTargetMs = baseTargetMs;
     }
 
+    // The queue level sawtooths: it rises by one capture packet and is drained
+    // in output-read gulps. The servo pins the AVERAGE at the target, so the
+    // minimum dips below it by roughly (packet + gulp); the cushion must cover
+    // both or the beat between the two cadences starves playback every few
+    // seconds even though the average looks healthy.
     public double EffectiveTargetMs => Math.Max(
         baseTargetMs,
-        Math.Max(peakPacketMs + PacketMarginMs, peakGapMs + GapMarginMs));
+        Math.Max(peakPacketMs + peakReadMs + PacketMarginMs, peakGapMs + GapMarginMs));
+
+    public void OnRead(double readMs)
+    {
+        if (readMs > peakReadMs)
+        {
+            peakReadMs = readMs;
+        }
+    }
 
     public void OnPacket(double packetMs)
     {

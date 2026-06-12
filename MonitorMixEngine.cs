@@ -360,6 +360,7 @@ public sealed class MonitorMixEngine : IDisposable
                 MixSampleRate,
                 () => (double)bufferedProvider.BufferedBytes / captureBytesPerMs,
                 () => queueState.EffectiveTargetMs,
+                queueState.OnRead,
                 $"Monitor {channelName}",
                 message => OnLog?.Invoke(this, message));
 

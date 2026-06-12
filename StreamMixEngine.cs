@@ -347,6 +347,7 @@ public sealed class StreamMixEngine : IDisposable
                 MixSampleRate,
                 () => (double)bufferedProvider.BufferedBytes / captureBytesPerMs,
                 () => queueState.EffectiveTargetMs,
+                queueState.OnRead,
                 $"Stream {channelName}",
                 message => OnLog?.Invoke(this, message));
 

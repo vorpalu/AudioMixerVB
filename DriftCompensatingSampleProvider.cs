@@ -21,6 +21,7 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
     private readonly WdlResampler resampler;
     private readonly Func<double> backlogMs;
     private readonly Func<double> targetBacklogMs;
+    private readonly Action<double>? onRead;
     private readonly string name;
     private readonly Action<string>? log;
     private readonly int channels;
@@ -32,12 +33,14 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
         int outputSampleRate,
         Func<double> backlogMs,
         Func<double> targetBacklogMs,
+        Action<double>? onRead,
         string name,
         Action<string>? log)
     {
         this.source = source;
         this.backlogMs = backlogMs;
         this.targetBacklogMs = targetBacklogMs;
+        this.onRead = onRead;
         this.name = name;
         this.log = log;
         channels = source.WaveFormat.Channels;
@@ -59,6 +62,8 @@ public sealed class DriftCompensatingSampleProvider : ISampleProvider
         {
             return 0;
         }
+
+        onRead?.Invoke(framesRequested * 1000.0 / WaveFormat.SampleRate);
 
         // Smooth the measured queue depth: it oscillates by a capture packet
         // (~10 ms) between callbacks, and the servo should track the average,
