@@ -267,23 +267,22 @@ public sealed class MonitorMixEngine : IDisposable
                 {
                     bufferedProvider.AddSamples(args.Buffer, 0, args.BytesRecorded);
 
-                    // Capture and render run on different device clocks; when capture drifts
-                    // ahead the queue grows and so does latency. Skip ahead gently to keep it
-                    // bounded. The backlog must be re-read on every pass: the playback thread
-                    // drains this buffer concurrently, and with ReadFully enabled Read never
-                    // reports starvation, so a stale excess would over-trim into silence.
+                    // Ordinary clock drift is corrected inaudibly by the servo resampler;
+                    // this skip-ahead only recovers from real stalls that leave a large
+                    // burst queued. The backlog must be re-read on every pass: the playback
+                    // thread drains this buffer concurrently, and with ReadFully enabled
+                    // Read never reports starvation, so a stale excess would over-trim.
                     var format = bufferedProvider.WaveFormat;
                     var bytesPerMs = Math.Max(1, format.AverageBytesPerSecond / 1000);
                     var targetBytes = bytesPerMs * Math.Max(15, LatencyMs);
-                    var thresholdBytes = targetBytes + bytesPerMs * Math.Max(15, LatencyMs);
+                    var thresholdBytes = targetBytes + bytesPerMs * 60;
                     if (bufferedProvider.BufferedBytes > thresholdBytes)
                     {
-                        var maxTrimBytes = bytesPerMs * 10;
                         var droppedBytes = 0;
-                        while (droppedBytes < maxTrimBytes)
+                        while (true)
                         {
                             var excessBytes = bufferedProvider.BufferedBytes - targetBytes;
-                            var chunk = Math.Min(Math.Min(excessBytes, maxTrimBytes - droppedBytes), trimBuffer.Length);
+                            var chunk = Math.Min(excessBytes, trimBuffer.Length);
                             chunk -= chunk % format.BlockAlign;
                             if (chunk <= 0)
                             {
@@ -297,7 +296,7 @@ public sealed class MonitorMixEngine : IDisposable
                         if (droppedBytes > 0 && now - lastTrimLogTicks >= 5000)
                         {
                             lastTrimLogTicks = now;
-                            OnLog?.Invoke(this, $"Monitor {channelName} backlog trimmed by {droppedBytes / bytesPerMs} ms to limit latency drift.");
+                            OnLog?.Invoke(this, $"Monitor {channelName} stall recovery: dropped {droppedBytes / bytesPerMs} ms of queued audio.");
                         }
                     }
                 }
@@ -325,10 +324,15 @@ public sealed class MonitorMixEngine : IDisposable
 
             ISampleProvider sampleProvider = bufferedProvider.ToSampleProvider();
             sampleProvider = EnsureStereo(sampleProvider);
-            if (sampleProvider.WaveFormat.SampleRate != MixSampleRate)
-            {
-                sampleProvider = new WdlResamplingSampleProvider(sampleProvider, MixSampleRate);
-            }
+
+            // The servo resampler keeps the queue at the target depth by nudging the
+            // playback rate, so per-cable clock drift never accumulates into trims.
+            var captureBytesPerMs = Math.Max(1, capture.WaveFormat.AverageBytesPerSecond / 1000);
+            sampleProvider = new DriftCompensatingSampleProvider(
+                sampleProvider,
+                MixSampleRate,
+                () => (double)bufferedProvider.BufferedBytes / captureBytesPerMs,
+                Math.Max(15, LatencyMs));
 
             // Resolve the meter once so the playback thread updates it directly and
             // never touches syncRoot, which the UI meter timer locks ~25x per second.
